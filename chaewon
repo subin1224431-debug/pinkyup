@@ -1,1 +1,1344 @@
+import cv2
+import numpy as np
+import time
+import threading
+import re
+from collections import deque
+from flask import Flask, Response, render_template_string
+from pinkylib import Camera, Motor, IR
 
+# ============================================================
+# AI OCR
+#
+# Raspberry Pi에서 PaddlePaddle 자체를 직접 쓰는 대신,
+# PP-OCR 계열 경량 모델을 ONNXRuntime으로 실행하는 RapidOCR 사용.
+#
+# 필요 패키지:
+#   pip install rapidocr onnxruntime
+#
+# 별도의 STOP/STATION 이미지 파일이나 best.pt는 필요하지 않음.
+# ============================================================
+try:
+    from rapidocr import RapidOCR
+except ImportError as e:
+    raise SystemExit(
+        "\n[OCR ERROR] RapidOCR가 설치되어 있지 않습니다.\n"
+        "한 번만 아래 명령으로 설치하세요:\n"
+        "pip install rapidocr onnxruntime\n"
+    ) from e
+
+# ============================================================
+# Pinky Pro - 화살표/STOP/STATION 중심선 추종
+#
+# 동작
+# 1) 시작: 도로 이진화만 하면서 직진
+# 2) 화살표: 기존 이진화/skeleton 검출
+#    STOP/STATION/GOAL: 기존 이진화 + AI OCR 보강
+#    (멀리 있어 이진화가 안 되는 글씨는 AI OCR이 먼저 검출)
+# 3) 목표 발견 -> 화면 중앙 정렬
+#    화살표: 내부 skeleton 중심선 추종
+#    글씨: OCR/bbox 중심 추종
+# 4) IR 센서가 검은색 감지 -> 정지
+# 5) 다음 목표가 안 보이면 오른쪽 제자리 회전하며 탐색
+# 6) 목표 발견 -> 중앙 정렬 -> 다시 직진/추종
+# ============================================================
+
+app = Flask(__name__)
+
+# ----------------------------
+# Hardware
+# ----------------------------
+motor = Motor()
+camera = Camera()
+ir = IR()
+
+motor.enable_motor()
+camera.start()
+
+# ----------------------------
+# Parameters
+# ----------------------------
+PORT = 5000
+
+# Motor speed
+STRAIGHT_SPEED = 22
+FOLLOW_SPEED = 19
+SEARCH_SPEED = 10
+ALIGN_SPEED = 10
+
+# Manual pulse
+MANUAL_SPEED = 24
+MANUAL_PULSE = 0.30
+
+# IR threshold
+IR_THRESHOLD = 2600
+
+# Camera ROI: 아래 50%, 좌우 10% 제외
+ROI_TOP_RATIO = 0.50
+ROI_SIDE_RATIO = 0.10
+
+# HSV thresholds
+WHITE_LO = np.array([0, 0, 175], dtype=np.uint8)
+WHITE_HI = np.array([180, 75, 255], dtype=np.uint8)
+
+BLACK_LO = np.array([0, 0, 0], dtype=np.uint8)
+BLACK_HI = np.array([180, 130, 115], dtype=np.uint8)
+
+# Detection
+MIN_BLACK_AREA = 350
+MIN_ARROW_AREA = 900
+MIN_TEXT_TOTAL_AREA = 600
+CENTER_TOL = 30
+
+# Control
+KP_ALIGN = 0.11
+KP_FOLLOW = 0.10
+MAX_CORR = 10
+
+# Search behavior
+IR_STOP_SEC = 0.45
+IR_AFTER_HIT_DRIVE_SEC = 1.0   # IR 감지 후 1초 더 직진한 뒤 정지
+IR_CLEAR_FRAMES = 4   # 검은 표식에서 벗어난 것이 연속 4프레임 확인되면 IR 재활성화
+LOST_TARGET_FRAMES = 5
+
+# Stream
+JPEG_QUALITY = 55
+
+# ----------------------------
+# AI OCR parameters
+# ----------------------------
+# OCR은 기존 이진화 ROI(아래 50%)보다 훨씬 넓은 화면을 본다.
+# 따라서 멀리 있어 화면 위쪽에 작게 보이는 STOP/STATION/GOAL도
+# 이진화보다 먼저 인식할 수 있다.
+OCR_TOP_RATIO = 0.08
+OCR_SIDE_RATIO = 0.04
+
+# 작은 글씨를 OCR에 넣기 전에 확대
+OCR_SCALE = 1.7
+
+# 영어 단어 인식 최소 confidence
+OCR_MIN_SCORE = 0.45
+
+# OCR이 읽을 단어
+OCR_WORDS = ("STOP", "STATION", "GOAL")
+
+# OCR 결과를 잠깐 유지하여 프레임 사이 깜빡임 방지
+OCR_RESULT_TTL = 1.0
+
+# 제어 루프 몇 프레임마다 OCR용 최신 프레임을 넘길지
+# OCR 자체는 별도 thread에서 실행되므로 주행 루프를 막지 않는다.
+OCR_SUBMIT_EVERY = 4
+
+# ----------------------------
+# State
+# ----------------------------
+state = "START"
+auto_mode = False
+stop_event = threading.Event()
+
+latest_jpeg = None
+jpeg_lock = threading.Lock()
+
+manual_until = 0.0
+manual_cmd = None
+
+lost_count = 0
+last_target = None
+ir_armed = True
+ir_clear_count = 0
+
+# ----------------------------
+# AI OCR shared state
+# ----------------------------
+ocr_engine = None
+
+ocr_frame_lock = threading.Lock()
+ocr_result_lock = threading.Lock()
+
+latest_ocr_frame = None
+latest_ocr_target_full = None
+latest_ocr_time = 0.0
+latest_ocr_word = ""
+latest_ocr_score = 0.0
+
+ocr_submit_counter = 0
+
+# ============================================================
+# Motor helpers
+# ============================================================
+
+def clamp(v, lo=-100, hi=100):
+    return max(lo, min(hi, int(v)))
+
+def drive(left, right):
+    left = clamp(left)
+    right = clamp(right)
+    motor.move(left, right)
+
+def stop_robot():
+    motor.move(0, 0)
+
+def p_drive(error, base, kp, max_corr):
+    corr = np.clip(kp * error, -max_corr, max_corr)
+    left = base + corr
+    right = base - corr
+    drive(left, right)
+
+# ============================================================
+# ROI / Masks
+# ============================================================
+
+def get_roi(frame):
+    h, w = frame.shape[:2]
+
+    y1 = int(h * ROI_TOP_RATIO)
+    x1 = int(w * ROI_SIDE_RATIO)
+    x2 = int(w * (1.0 - ROI_SIDE_RATIO))
+
+    roi = frame[y1:h, x1:x2]
+    return roi, x1, y1
+
+def make_masks(roi):
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    white = cv2.inRange(hsv, WHITE_LO, WHITE_HI)
+    black = cv2.inRange(hsv, BLACK_LO, BLACK_HI)
+
+    k3 = np.ones((3, 3), np.uint8)
+    k7 = np.ones((7, 7), np.uint8)
+
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, k3)
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, k7)
+
+    black = cv2.morphologyEx(black, cv2.MORPH_OPEN, k3)
+    black = cv2.morphologyEx(black, cv2.MORPH_CLOSE, k3)
+
+    # --------------------------------------------------------
+    # 중요:
+    # 예전처럼 white를 단순 dilate해서 black과 AND하면
+    # 화살표 내부가 잘리고 테두리만 남는 문제가 생김.
+    #
+    # 그래서 흰 도로의 가장 큰 외곽 contour를 "채워서"
+    # 화살표/글씨가 들어있는 도로 전체 영역을 만든다.
+    # --------------------------------------------------------
+    road_region = np.zeros_like(white)
+
+    contours, _ = cv2.findContours(
+        white,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+
+        if cv2.contourArea(largest) > 1000:
+            cv2.drawContours(
+                road_region,
+                [largest],
+                -1,
+                255,
+                -1
+            )
+
+            # 도로 경계가 조금 끊겨도 내부를 유지
+            road_region = cv2.dilate(
+                road_region,
+                np.ones((9,9), np.uint8),
+                iterations=1
+            )
+        else:
+            road_region[:] = 255
+    else:
+        road_region[:] = 255
+
+    black = cv2.bitwise_and(black, road_region)
+
+    return white, black, road_region
+
+# ============================================================
+# Skeleton
+# ============================================================
+
+def skeletonize(mask):
+    img = mask.copy()
+    skel = np.zeros_like(img)
+
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3,3))
+
+    while True:
+        eroded = cv2.erode(img, element)
+        temp = cv2.dilate(eroded, element)
+        temp = cv2.subtract(img, temp)
+        skel = cv2.bitwise_or(skel, temp)
+        img = eroded
+
+        if cv2.countNonZero(img) == 0:
+            break
+
+    return skel
+
+def largest_component(mask):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+
+    if n <= 1:
+        return None
+
+    best = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    area = stats[best, cv2.CC_STAT_AREA]
+
+    if area < MIN_BLACK_AREA:
+        return None
+
+    out = np.zeros_like(mask)
+    out[labels == best] = 255
+
+    return out
+
+def skeleton_centerline(mask):
+    """
+    화살표 내부를 1픽셀 skeleton으로 만든다.
+    화면 표시에서는 skeleton 자체를 그대로 그린다.
+
+    주행용 중심점은 화살표 bbox의 아래쪽~중간 구간에서
+    skeleton 좌표를 찾아 사용한다.
+    """
+    skel = skeletonize(mask)
+
+    ys, xs = np.where(skel > 0)
+
+    if len(xs) < 10:
+        return skel, [], None
+
+    # skeleton 전체 표시용
+    points = list(zip(xs.astype(int), ys.astype(int)))
+
+    # 화살표의 실제 bbox
+    py, px = np.where(mask > 0)
+
+    if len(px) == 0:
+        return skel, points, None
+
+    x0, x1 = int(px.min()), int(px.max())
+    y0, y1 = int(py.min()), int(py.max())
+    hh = max(1, y1-y0+1)
+
+    # 아래쪽에서 약 55~72% 높이의 중심선을 주행 look-ahead로 사용
+    # (화살촉 가지가 갈라지는 맨 위쪽은 피함)
+    band_top = int(y0 + 0.55*hh)
+    band_bottom = int(y0 + 0.72*hh)
+
+    sel = (ys >= band_top) & (ys <= band_bottom)
+
+    if np.any(sel):
+        tx = int(np.median(xs[sel]))
+        ty = int(np.median(ys[sel]))
+        follow_point = (tx,ty)
+    else:
+        # fallback: skeleton 전체 중앙
+        follow_point = (
+            int(np.median(xs)),
+            int(np.median(ys))
+        )
+
+    return skel, points, follow_point
+
+# ============================================================
+# Target detection
+# ============================================================
+
+def find_black_groups(black_mask):
+    contours, _ = cv2.findContours(
+        black_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    items = []
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 80:
+            continue
+
+        x,y,w,h = cv2.boundingRect(c)
+        items.append({
+            "contour": c,
+            "area": area,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h
+        })
+
+    return items
+
+def detect_target(black_mask):
+    """
+    검은 표식 검출
+
+    TEXT:
+    - STOP/STATION은 글자들이 서로 떨어져 있어도 한 줄로 묶음
+    - 각 글자가 화살표처럼 하나의 큰 덩어리일 필요 없음
+    - 비슷한 y 위치에 있는 작은 검은 contour들을 가로 방향으로 clustering
+
+    ARROW:
+    - 큰 단일 연결 덩어리이면 화살표로 처리
+    """
+    items = find_black_groups(black_mask)
+
+    if not items:
+        return None
+
+    # ========================================================
+    # 1) TEXT 후보
+    # ========================================================
+    # 글자 하나하나가 작은 조각으로 끊겨도 최대한 포함
+    chars = [
+        z for z in items
+        if z["area"] >= 18
+        and z["h"] >= 6
+        and z["w"] >= 2
+    ]
+
+    # y 중심 좌표로 가까운 글자끼리 한 줄로 grouping
+    groups = []
+
+    for z in sorted(chars, key=lambda q: q["x"]):
+        cy = z["y"] + z["h"]/2
+
+        placed = False
+
+        for g in groups:
+            gy = np.mean([
+                a["y"] + a["h"]/2
+                for a in g
+            ])
+
+            gh = np.mean([a["h"] for a in g])
+
+            # 같은 줄이라고 볼 수 있는 y 허용범위
+            if abs(cy - gy) <= max(12, 0.8*gh):
+                g.append(z)
+                placed = True
+                break
+
+        if not placed:
+            groups.append([z])
+
+    text_candidates = []
+
+    for g in groups:
+        if len(g) < 3:
+            continue
+
+        xs  = [z["x"] for z in g]
+        ys  = [z["y"] for z in g]
+        x2s = [z["x"] + z["w"] for z in g]
+        y2s = [z["y"] + z["h"] for z in g]
+
+        x1 = min(xs)
+        y1 = min(ys)
+        x2 = max(x2s)
+        y2 = max(y2s)
+
+        width = x2 - x1
+        height = y2 - y1
+        total_area = sum(z["area"] for z in g)
+
+        if height <= 0:
+            continue
+
+        aspect = width / float(height)
+
+        # STOP/STATION은 전체적으로 가로로 긴 영역
+        if (
+            total_area >= 120
+            and width >= 35
+            and height >= 8
+            and aspect >= 1.7
+        ):
+            text_candidates.append({
+                "group": g,
+                "bbox": (x1,y1,width,height),
+                "area": total_area
+            })
+
+    if text_candidates:
+        # 가장 넓고 면적 큰 한 줄 선택
+        best = max(
+            text_candidates,
+            key=lambda z: z["bbox"][2] * z["bbox"][3]
+        )
+
+        x,y,w,h = best["bbox"]
+
+        return {
+            "type": "TEXT",
+            "bbox": (x,y,w,h),
+            "center": (x+w//2, y+h//2),
+            "mask": None,
+            "skeleton": None,
+            "path": [],
+            "follow_point": (x+w//2, y+h//2)
+        }
+
+    # ========================================================
+    # 2) ARROW 후보
+    # ========================================================
+    biggest = max(items, key=lambda z: z["area"])
+
+    if biggest["area"] >= MIN_ARROW_AREA:
+        x,y,w,h = (
+            biggest["x"],
+            biggest["y"],
+            biggest["w"],
+            biggest["h"]
+        )
+
+        if h >= 22 and w >= 18:
+            single = np.zeros_like(black_mask)
+
+            cv2.drawContours(
+                single,
+                [biggest["contour"]],
+                -1,
+                255,
+                -1
+            )
+
+            skel, path, follow_point = skeleton_centerline(single)
+
+            if follow_point is not None:
+                return {
+                    "type": "ARROW",
+                    "bbox": (x,y,w,h),
+                    "center": follow_point,
+                    "mask": single,
+                    "skeleton": skel,
+                    "path": path,
+                    "follow_point": follow_point
+                }
+
+    return None
+
+
+# ============================================================
+# AI OCR helpers
+# ============================================================
+
+def normalize_ocr_text(text):
+    """
+    STOP / STATION / GOAL처럼 영문 대문자 표식만 필요하므로
+    공백/기호 제거 + 자주 생기는 OCR 숫자 오인식 보정.
+    """
+    s = str(text).upper().strip()
+
+    # 흔한 OCR 오인식 보정
+    s = s.replace("0", "O")
+    s = s.replace("1", "I")
+    s = s.replace("5", "S")
+
+    # 영문자만 남김
+    s = re.sub(r"[^A-Z]", "", s)
+
+    return s
+
+
+def find_ocr_keyword(text):
+    s = normalize_ocr_text(text)
+
+    for word in OCR_WORDS:
+        if word in s:
+            return word
+
+    return None
+
+
+def submit_ocr_frame(frame):
+    """
+    control_loop는 절대 OCR 추론을 직접 기다리지 않는다.
+    최신 frame만 worker에 넘긴다.
+    """
+    global latest_ocr_frame
+
+    with ocr_frame_lock:
+        latest_ocr_frame = frame.copy()
+
+
+def clear_ocr_target():
+    global latest_ocr_target_full
+    global latest_ocr_time
+    global latest_ocr_word
+    global latest_ocr_score
+
+    with ocr_result_lock:
+        latest_ocr_target_full = None
+        latest_ocr_time = 0.0
+        latest_ocr_word = ""
+        latest_ocr_score = 0.0
+
+
+def get_live_ocr_target(ox, oy):
+    """
+    OCR worker 결과는 full-frame 좌표다.
+    기존 target 구조는 ROI 상대좌표를 쓰므로 변환해서 반환한다.
+    """
+    with ocr_result_lock:
+        target_full = latest_ocr_target_full
+        ts = latest_ocr_time
+
+        if target_full is None:
+            return None
+
+        if time.time() - ts > OCR_RESULT_TTL:
+            return None
+
+        x, y, w, h = target_full["bbox_full"]
+        cx, cy = target_full["center_full"]
+
+        return {
+            "type": "OCR_TEXT",
+            "label": f'OCR:{target_full["word"]}',
+            "word": target_full["word"],
+            "score": target_full["score"],
+            "bbox": (
+                int(x - ox),
+                int(y - oy),
+                int(w),
+                int(h)
+            ),
+            "center": (
+                int(cx - ox),
+                int(cy - oy)
+            ),
+            "mask": None,
+            "skeleton": None,
+            "path": [],
+            "follow_point": (
+                int(cx - ox),
+                int(cy - oy)
+            )
+        }
+
+
+def ocr_worker():
+    """
+    PP-OCR 계열 AI OCR을 별도 thread에서 수행.
+
+    - 기존 이진화는 그대로 유지
+    - AI OCR은 STOP / STATION / GOAL만 받아들임
+    - 화살표는 기존 skeleton/이진화 검출을 그대로 사용
+    """
+    global ocr_engine
+    global latest_ocr_frame
+    global latest_ocr_target_full
+    global latest_ocr_time
+    global latest_ocr_word
+    global latest_ocr_score
+
+    print("[OCR] RapidOCR loading...")
+
+    try:
+        # RapidOCR wheel에 포함된 경량 PP-OCR 계열 모델 사용
+        ocr_engine = RapidOCR()
+        print("[OCR] RapidOCR ready")
+
+    except Exception as e:
+        print("[OCR] INIT FAILED:", e)
+        return
+
+    while not stop_event.is_set():
+
+        frame = None
+
+        with ocr_frame_lock:
+            if latest_ocr_frame is not None:
+                frame = latest_ocr_frame
+                latest_ocr_frame = None
+
+        if frame is None:
+            time.sleep(0.02)
+            continue
+
+        try:
+            h, w = frame.shape[:2]
+
+            # 기존 아래 50% ROI와 달리 화면 위쪽부터 넓게 확인
+            x1 = int(w * OCR_SIDE_RATIO)
+            x2 = int(w * (1.0 - OCR_SIDE_RATIO))
+            y1 = int(h * OCR_TOP_RATIO)
+            y2 = h
+
+            crop = frame[y1:y2, x1:x2]
+
+            if crop.size == 0:
+                continue
+
+            # 멀리 있는 작은 글씨를 detector가 보기 쉽게 확대
+            ocr_input = cv2.resize(
+                crop,
+                None,
+                fx=OCR_SCALE,
+                fy=OCR_SCALE,
+                interpolation=cv2.INTER_CUBIC
+            )
+
+            # 글씨는 정방향이므로 orientation classifier는 끔
+            result = ocr_engine(
+                ocr_input,
+                use_det=True,
+                use_cls=False,
+                use_rec=True
+            )
+
+            boxes = getattr(result, "boxes", None)
+            txts = getattr(result, "txts", None)
+            scores = getattr(result, "scores", None)
+
+            if boxes is None or txts is None or scores is None:
+                continue
+
+            best = None
+
+            for box, txt, score in zip(boxes, txts, scores):
+
+                score = float(score)
+
+                if score < OCR_MIN_SCORE:
+                    continue
+
+                keyword = find_ocr_keyword(txt)
+
+                if keyword is None:
+                    continue
+
+                pts = np.asarray(
+                    box,
+                    dtype=np.float32
+                )
+
+                # OCR_INPUT(scale 적용) -> crop 좌표 -> full frame 좌표
+                xs = pts[:, 0] / OCR_SCALE
+                ys = pts[:, 1] / OCR_SCALE
+
+                bx1 = float(xs.min()) + x1
+                by1 = float(ys.min()) + y1
+                bx2 = float(xs.max()) + x1
+                by2 = float(ys.max()) + y1
+
+                bw = max(1.0, bx2 - bx1)
+                bh = max(1.0, by2 - by1)
+
+                candidate = {
+                    "word": keyword,
+                    "score": score,
+                    "bbox_full": (
+                        int(bx1),
+                        int(by1),
+                        int(bw),
+                        int(bh)
+                    ),
+                    "center_full": (
+                        int((bx1 + bx2) / 2.0),
+                        int((by1 + by2) / 2.0)
+                    )
+                }
+
+                # 같은 프레임에 여러 단어가 있으면 confidence가 높은 것 우선
+                if best is None or score > best["score"]:
+                    best = candidate
+
+            if best is not None:
+
+                with ocr_result_lock:
+                    latest_ocr_target_full = best
+                    latest_ocr_time = time.time()
+                    latest_ocr_word = best["word"]
+                    latest_ocr_score = best["score"]
+
+                print(
+                    f'[OCR] {best["word"]} '
+                    f'{best["score"]:.2f}'
+                )
+
+        except Exception as e:
+            # OCR 한 프레임 실패로 전체 주행 프로그램을 죽이지 않음
+            print("[OCR] frame error:", e)
+
+        time.sleep(0.01)
+
+
+def choose_target(binary_target, ocr_target):
+    """
+    우선순위:
+      1) 기존 이진화가 화살표를 잡았으면 화살표 우선
+      2) AI OCR이 STOP/STATION/GOAL을 읽었으면 OCR 글씨
+      3) 둘 다 아니면 기존 이진화 TEXT 사용
+
+    즉 기존 화살표 로직은 건드리지 않고,
+    멀리 있는 글씨만 AI가 보강한다.
+    """
+    if (
+        binary_target is not None
+        and binary_target.get("type") == "ARROW"
+    ):
+        return binary_target
+
+    if ocr_target is not None:
+        return ocr_target
+
+    return binary_target
+
+
+# ============================================================
+# Visualization
+# ============================================================
+
+def draw_target(vis, target, ox, oy):
+    if target is None:
+        return
+
+    x,y,w,h = target["bbox"]
+    cx,cy = target["center"]
+
+    if target["type"] == "ARROW":
+        color = (255,0,0)
+
+        # 실제 1픽셀 skeleton을 화면에 굵게 표시
+        skel = target["skeleton"]
+
+        if skel is not None:
+            sy, sx = np.where(skel > 0)
+
+            for px, py in zip(sx, sy):
+                xx = int(px + ox)
+                yy = int(py + oy)
+
+                if (
+                    1 <= yy < vis.shape[0]-1
+                    and 1 <= xx < vis.shape[1]-1
+                ):
+                    cv2.circle(
+                        vis,
+                        (xx,yy),
+                        1,
+                        (255,0,0),
+                        -1
+                    )
+
+        # 실제 주행에 사용하는 중심점
+        cv2.circle(
+            vis,
+            (cx+ox,cy+oy),
+            7,
+            (0,0,255),
+            -1
+        )
+
+    elif target["type"] == "OCR_TEXT":
+        color = (0,165,255)
+
+        cv2.circle(
+            vis,
+            (cx+ox,cy+oy),
+            7,
+            (0,0,255),
+            -1
+        )
+
+    else:
+        color = (255,0,255)
+
+        cv2.circle(
+            vis,
+            (cx+ox,cy+oy),
+            7,
+            (0,0,255),
+            -1
+        )
+
+    cv2.rectangle(
+        vis,
+        (x+ox,y+oy),
+        (x+w+ox,y+h+oy),
+        color,
+        2
+    )
+
+    label = target.get("label", target["type"])
+
+    if target.get("type") == "OCR_TEXT":
+        score = target.get("score", 0.0)
+        label = f"{label} {score:.2f}"
+
+    cv2.putText(
+        vis,
+        label,
+        (x+ox,max(20,y+oy-8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        .55,
+        color,
+        2
+    )
+
+# ============================================================
+# State machine
+# ============================================================
+
+def control_loop():
+    global state, auto_mode, latest_jpeg
+    global manual_until, manual_cmd
+    global ir_armed, ir_clear_count
+    global lost_count, last_target
+    global ir_armed, ir_clear_count
+    global ocr_submit_counter
+
+    ir_stop_time = 0.0
+
+    while not stop_event.is_set():
+
+        frame = camera.get_frame()
+
+        if frame is None:
+            time.sleep(0.02)
+            continue
+
+        frame = cv2.flip(frame, -1) if False else frame.copy()
+
+        h, w = frame.shape[:2]
+        roi, ox, oy = get_roi(frame)
+        white_mask, black_mask, road_region = make_masks(roi)
+
+        # ----------------------------------------------------
+        # 기존 이진화 target
+        # ----------------------------------------------------
+        binary_target = detect_target(black_mask)
+
+        # ----------------------------------------------------
+        # AI OCR용 프레임은 별도 thread에 전달
+        # control loop 자체는 OCR을 기다리지 않음
+        # ----------------------------------------------------
+        ocr_submit_counter += 1
+
+        if ocr_submit_counter >= OCR_SUBMIT_EVERY:
+            submit_ocr_frame(frame)
+            ocr_submit_counter = 0
+
+        # 멀리 있는 STOP / STATION / GOAL AI OCR 결과
+        ocr_target = get_live_ocr_target(ox, oy)
+
+        # 화살표는 기존 방식 우선,
+        # 글씨는 AI OCR로 보강
+        target = choose_target(
+            binary_target,
+            ocr_target
+        )
+
+        ir_l, ir_c, ir_r = ir.read_ir()
+        ir_hit = (
+            ir_l >= IR_THRESHOLD or
+            ir_c >= IR_THRESHOLD or
+            ir_r >= IR_THRESHOLD
+        )
+
+        # ----------------------------------------------------
+        # IR 재활성화 로직
+        # 한 번 검은 표식에서 멈춘 직후에는 IR을 잠시 무시한다.
+        # 로봇이 그 검은 표식에서 완전히 벗어나 센서가 연속 몇 프레임
+        # "흰 바닥"을 본 뒤에만 다시 IR 감지를 활성화한다.
+        # ----------------------------------------------------
+        if not ir_armed:
+            if not ir_hit:
+                ir_clear_count += 1
+            else:
+                ir_clear_count = 0
+
+            if ir_clear_count >= IR_CLEAR_FRAMES:
+                ir_armed = True
+                ir_clear_count = 0
+
+        # --------------------------------
+        # Manual override
+        # --------------------------------
+        if time.time() < manual_until and manual_cmd is not None:
+            l, r = manual_cmd
+            drive(l, r)
+
+        elif not auto_mode:
+            stop_robot()
+
+        else:
+            # ====================================================
+            # START
+            # 검은 목표가 보일 때까지 직진
+            # ====================================================
+            if state == "START":
+                if target is None:
+                    drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
+                else:
+                    last_target = target
+                    state = "ALIGN"
+
+            # ====================================================
+            # ALIGN
+            # 화살표/글씨 중심을 화면 가운데로 정렬
+            # ====================================================
+            elif state == "ALIGN":
+                if target is None:
+                    lost_count += 1
+
+                    if lost_count >= LOST_TARGET_FRAMES:
+                        state = "SEARCH_RIGHT"
+                        lost_count = 0
+                else:
+                    lost_count = 0
+                    last_target = target
+
+                    target_x = target["center"][0] + ox
+                    error = target_x - (w/2)
+
+                    if abs(error) <= CENTER_TOL:
+                        stop_robot()
+                        state = "FOLLOW"
+                    else:
+                        # 정렬은 제자리 회전
+                        turn = int(np.clip(KP_ALIGN * error, -ALIGN_SPEED, ALIGN_SPEED))
+
+                        if turn > 0:
+                            drive(ALIGN_SPEED, -ALIGN_SPEED)
+                        else:
+                            drive(-ALIGN_SPEED, ALIGN_SPEED)
+
+            # ====================================================
+            # FOLLOW
+            # 화살표는 skeleton 중심선 / 글씨는 bbox 중심 추종
+            # ====================================================
+            elif state == "FOLLOW":
+                if ir_armed and ir_hit:
+                    # IR이 검은 표식을 처음 감지하면 바로 멈추지 않고
+                    # 1초간 더 직진하여 표식을 완전히 통과
+                    ir_armed = False
+                    ir_clear_count = 0
+                    ir_stop_time = time.time()
+                    state = "IR_CONTINUE"
+
+                elif target is not None:
+                    last_target = target
+                    target_x = target["center"][0] + ox
+                    error = target_x - (w/2)
+
+                    p_drive(
+                        error,
+                        FOLLOW_SPEED,
+                        KP_FOLLOW,
+                        MAX_CORR
+                    )
+
+                else:
+                    drive(FOLLOW_SPEED, FOLLOW_SPEED)
+
+            elif state == "IR_CONTINUE":
+                # 기존 검은 글씨/화살표를 벗어나기 위해
+                # IR 감지 후 1초간 추가 직진
+                if time.time() - ir_stop_time < IR_AFTER_HIT_DRIVE_SEC:
+                    drive(FOLLOW_SPEED, FOLLOW_SPEED)
+                else:
+                    stop_robot()
+                    ir_stop_time = time.time()
+                    state = "IR_STOP"
+
+            # ====================================================
+            # IR STOP
+            # 실제 목표 위 도착
+            # ====================================================
+            elif state == "IR_STOP":
+                stop_robot()
+
+                if time.time() - ir_stop_time >= IR_STOP_SEC:
+                    # 1초 더 주행해서 이전 표식을 벗어난 뒤이므로
+                    # 이전 OCR 결과를 비우고 다음 표식을 다시 탐색
+                    clear_ocr_target()
+                    state = "SEARCH_RIGHT"
+
+            # ====================================================
+            # SEARCH_RIGHT
+            # 다음 목표가 안 보이면 오른쪽 제자리 회전
+            # ====================================================
+            elif state == "SEARCH_RIGHT":
+                # 오른쪽으로 회전하면서 화살표 또는 글씨 둘 다 탐색
+                if target is not None:
+                    stop_robot()
+                    last_target = target
+                    lost_count = 0
+                    state = "ALIGN"
+                else:
+                    drive(SEARCH_SPEED, -SEARCH_SPEED)
+
+        # ========================================================
+        # Draw
+        # ========================================================
+        vis = frame.copy()
+
+        # ROI
+        cv2.rectangle(
+            vis,
+            (ox,oy),
+            (w-ox,h-1),
+            (0,255,0),
+            2
+        )
+
+        # screen center
+        cv2.line(
+            vis,
+            (w//2,0),
+            (w//2,h),
+            (255,255,255),
+            1
+        )
+
+        draw_target(vis, target, ox, oy)
+
+        shown_state = state if auto_mode else f"PAUSED / {state}"
+
+        cv2.putText(
+            vis,
+            f"STATE: {shown_state}",
+            (12,28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .65,
+            (0,255,255),
+            2
+        )
+
+        cv2.putText(
+            vis,
+            f"AUTO: {auto_mode}",
+            (12,55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .55,
+            (0,255,255),
+            2
+        )
+
+        cv2.putText(
+            vis,
+            f"IR L:{ir_l} C:{ir_c} R:{ir_r}",
+            (12,82),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .50,
+            (0,255,255),
+            2
+        )
+
+        cv2.putText(
+            vis,
+            f"IR_ARMED: {ir_armed}",
+            (12,108),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .48,
+            (0,255,255),
+            2
+        )
+
+        with ocr_result_lock:
+            ocr_word_for_vis = latest_ocr_word
+            ocr_score_for_vis = latest_ocr_score
+            ocr_age_for_vis = (
+                time.time() - latest_ocr_time
+                if latest_ocr_time > 0
+                else 999.0
+            )
+
+        if ocr_age_for_vis <= OCR_RESULT_TTL:
+            ocr_text_for_vis = (
+                f"OCR: {ocr_word_for_vis} "
+                f"{ocr_score_for_vis:.2f}"
+            )
+        else:
+            ocr_text_for_vis = "OCR: -"
+
+        cv2.putText(
+            vis,
+            ocr_text_for_vis,
+            (12,134),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .48,
+            (0,165,255),
+            2
+        )
+
+        # binary preview
+        binary_bgr = cv2.cvtColor(black_mask, cv2.COLOR_GRAY2BGR)
+        binary_bgr = cv2.resize(
+            binary_bgr,
+            (vis.shape[1], vis.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        combo = np.hstack([vis, binary_bgr])
+
+        ok, jpg = cv2.imencode(
+            ".jpg",
+            combo,
+            [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        )
+
+        if ok:
+            with jpeg_lock:
+                latest_jpeg = jpg.tobytes()
+
+        time.sleep(0.03)
+
+# ============================================================
+# Flask
+# ============================================================
+
+HTML = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pinky Vision</title>
+<style>
+body{background:#111;color:white;font-family:Arial;text-align:center}
+img{width:95%;max-width:1200px;border:2px solid #555}
+button{font-size:24px;margin:5px;padding:10px 20px}
+</style>
+</head>
+<body>
+<h2>Pinky Arrow / STOP / STATION Tracking</h2>
+<img src="/video_feed">
+<div>
+<button onclick="cmd('w')">W</button>
+<button onclick="cmd('s')">S</button>
+<button onclick="cmd('a')">A</button>
+<button onclick="cmd('d')">D</button>
+<button onclick="cmd('p')">AUTO</button>
+<button onclick="cmd('r')">RESET</button>
+<button onclick="cmd('space')">STOP</button>
+</div>
+
+<script>
+function cmd(k){
+    fetch('/cmd/'+k);
+}
+document.addEventListener('keydown',function(e){
+    if(e.repeat) return;
+
+    let k=e.key.toLowerCase();
+
+    if(e.code==='Space'){
+        e.preventDefault();
+        cmd('space');
+    }
+    else if(['w','a','s','d','p','r'].includes(k)){
+        cmd(k);
+    }
+});
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+def mjpeg():
+    while True:
+        with jpeg_lock:
+            data = latest_jpeg
+
+        if data is not None:
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' +
+                data +
+                b'\r\n'
+            )
+
+        time.sleep(0.04)
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        mjpeg(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
+
+@app.route("/cmd/<key>")
+def command(key):
+    global auto_mode, state
+    global manual_until, manual_cmd
+    global ir_armed, ir_clear_count
+
+    if key == "p":
+        auto_mode = not auto_mode
+
+        if auto_mode:
+            state = "START"
+            clear_ocr_target()
+        else:
+            stop_robot()
+
+    elif key == "r":
+        auto_mode = False
+        state = "START"
+        ir_armed = True
+        ir_clear_count = 0
+        clear_ocr_target()
+        stop_robot()
+
+    elif key == "space":
+        auto_mode = False
+        stop_robot()
+
+    elif key == "w":
+        manual_cmd = (MANUAL_SPEED, MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
+
+    elif key == "s":
+        manual_cmd = (-MANUAL_SPEED, -MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
+
+    elif key == "a":
+        manual_cmd = (-MANUAL_SPEED, MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
+
+    elif key == "d":
+        manual_cmd = (MANUAL_SPEED, -MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
+
+    return "OK"
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+    # AI OCR worker: 글씨 인식만 담당, 주행 loop를 막지 않음
+    threading.Thread(
+        target=ocr_worker,
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=control_loop,
+        daemon=True
+    ).start()
+
+    print("Pinky server started")
+    print("http://ROBOT_IP:5000")
+
+    try:
+        app.run(
+            host="0.0.0.0",
+            port=PORT,
+            threaded=True,
+            debug=False
+        )
+    finally:
+        stop_event.set()
+        stop_robot()
