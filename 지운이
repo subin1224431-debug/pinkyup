@@ -6,7 +6,7 @@ from flask import Flask, Response, render_template_string
 from pinkylib import Camera, Motor
 
 # ==========================================
-# 1. 하드웨어 및 웹 서버 초기화
+# 1. 하드웨어 및 파라미터 초기화
 # ==========================================
 app = Flask(__name__)
 
@@ -16,13 +16,22 @@ camera = Camera()
 motor.enable_motor()
 camera.start()
 
-# 주행 제어 파라미터
+# 웹 서버 및 주행 제어 파라미터
 PORT = 5000
 STRAIGHT_SPEED = 22
 ALIGN_SPEED = 12
 KP = 0.15
 CENTER_TOLERANCE = 25
 PASSED_DRIVE_TIME = 1.5
+
+# road_test.py의 정밀 HSV 색상 범위 적용
+WHITE_LO = np.array([0, 0, 175], dtype=np.uint8)
+WHITE_HI = np.array([180, 75, 255], dtype=np.uint8)
+
+BLACK_LO = np.array([0, 0, 0], dtype=np.uint8)
+BLACK_HI = np.array([180, 130, 115], dtype=np.uint8)
+
+MIN_ARROW_AREA = 500
 
 # 상태 및 동기화 변수
 state = "SEARCH"
@@ -36,7 +45,43 @@ def stop_robot():
     motor.move(0, 0)
 
 # ==========================================
-# 2. 비전 처리 및 주행 FSM 제어 루프 (스레드)
+# 2. road_test.py 전처리 이식 (도로 내 검은색 이진화)
+# ==========================================
+def make_masks(roi):
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    white = cv2.inRange(hsv, WHITE_LO, WHITE_HI)
+    black = cv2.inRange(hsv, BLACK_LO, BLACK_HI)
+
+    k3 = np.ones((3, 3), np.uint8)
+    k7 = np.ones((7, 7), np.uint8)
+
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, k3)
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, k7)
+
+    black = cv2.morphologyEx(black, cv2.MORPH_OPEN, k3)
+    black = cv2.morphologyEx(black, cv2.MORPH_CLOSE, k3)
+
+    # 흰색 도로 트랙 외곽선 채우기 (도로 내부 영역 생성)
+    road_region = np.zeros_like(white)
+    contours, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) > 1000:
+            cv2.drawContours(road_region, [largest], -1, 255, -1)
+            road_region = cv2.dilate(road_region, np.ones((9, 9), np.uint8), iterations=1)
+        else:
+            road_region[:] = 255
+    else:
+        road_region[:] = 255
+
+    # 흰색 도로 내부 영역에 포함된 검은색 영역만 최종 마스크로 추출
+    black = cv2.bitwise_and(black, road_region)
+    return white, black, road_region
+
+# ==========================================
+# 3. 주행 및 비전 제어 루프 (스레드)
 # ==========================================
 def control_loop():
     global state, auto_mode, latest_jpeg
@@ -52,48 +97,41 @@ def control_loop():
         h, w = frame.shape[:2]
         center_x = w // 2
 
-        # 하단 50% ROI 설정
+        # 하단 50% 관심 영역(ROI) 설정
         roi_y = int(h * 0.5)
         roi = frame[roi_y:h, 0:w]
 
-        # 검은색 화살표 추출
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 255, 75])
+        # road_test 기반 정밀 마스크 추출
+        _, black_mask, _ = make_masks(roi)
 
-        mask = cv2.inRange(hsv, lower_black, upper_black)
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         target_cx = None
         target_cy = None
 
         if contours:
             largest_c = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_c) > 600:
+            if cv2.contourArea(largest_c) >= MIN_ARROW_AREA:
                 M = cv2.moments(largest_c)
                 if M["m00"] != 0:
                     target_cx = int(M["m10"] / M["m00"])
                     target_cy = int(M["m01"] / M["m00"])
 
-                    # 시각화 데이터 그리기
+                    # 시각화 (중심점 빨간 원, 바운딩 윤곽선 초록색)
                     cv2.circle(roi, (target_cx, target_cy), 6, (0, 0, 255), -1)
                     cv2.drawContours(roi, [largest_c], -1, (0, 255, 0), 2)
 
         # ------------------------------------------
-        # FSM 주행 상태 머신
+        # 화살표 순차 주행 FSM 제어
         # ------------------------------------------
         if auto_mode:
-            # 1) SEARCH: 화살표를 찾을 때까지 직진
+            # 1) SEARCH: 화살표를 찾을 때까지 직진 주행
             if state == "SEARCH":
                 motor.move(STRAIGHT_SPEED, STRAIGHT_SPEED)
                 if target_cx is not None:
                     state = "ALIGN"
 
-            # 2) ALIGN: 화살표 중심에 맞추어 제자리 정렬
+            # 2) ALIGN: 감지된 화살표 중심에 맞추어 제자리 회전 정렬
             elif state == "ALIGN":
                 if target_cx is None:
                     state = "SEARCH"
@@ -107,7 +145,7 @@ def control_loop():
                         else:
                             motor.move(-ALIGN_SPEED, ALIGN_SPEED)
 
-            # 3) FOLLOW: 화살표를 조향하며 진입
+            # 3) FOLLOW: 화살표 방향으로 조향하여 진입
             elif state == "FOLLOW":
                 if target_cx is not None:
                     error = target_cx - center_x
@@ -118,7 +156,7 @@ def control_loop():
                     pass_timer = time.time()
                     state = "PASSED"
 
-            # 4) PASSED: 통과 후 일정 시간 직진 후 다음 화살표 탐색
+            # 4) PASSED: 화살표 위를 완벽히 통과할 때까지 직진 후 다시 다음 화살표 탐색
             elif state == "PASSED":
                 if time.time() - pass_timer < PASSED_DRIVE_TIME:
                     motor.move(STRAIGHT_SPEED, STRAIGHT_SPEED)
@@ -129,7 +167,7 @@ def control_loop():
             stop_robot()
 
         # ------------------------------------------
-        # 웹 스트리밍용 영상 합성
+        # 웹 스트리밍용 영상 합성 (원본 ROI + 이진화 마스크 옆에 나란히 배치)
         # ------------------------------------------
         vis = frame.copy()
         cv2.line(vis, (center_x, 0), (center_x, h), (255, 255, 255), 1)
@@ -137,7 +175,11 @@ def control_loop():
         status_text = f"AUTO: {'ON' if auto_mode else 'OFF'} | STATE: {state}"
         cv2.putText(vis, status_text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-        ok, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        binary_bgr = cv2.cvtColor(black_mask, cv2.COLOR_GRAY2BGR)
+        binary_bgr = cv2.resize(binary_bgr, (vis.shape[1], vis.shape[0]), interpolation=cv2.INTER_NEAREST)
+        combo = np.hstack([vis, binary_bgr])
+
+        ok, jpg = cv2.imencode(".jpg", combo, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
         if ok:
             with jpeg_lock:
                 latest_jpeg = jpg.tobytes()
@@ -145,22 +187,22 @@ def control_loop():
         time.sleep(0.03)
 
 # ==========================================
-# 3. Flask 웹 인터페이스 및 스트리밍
+# 4. 웹 UI 및 브라우저 키보드 이벤트
 # ==========================================
 HTML = """
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Pinky Arrow Navigation</title>
+<title>Pinky Robust Arrow Tracking</title>
 <style>
 body{background:#111;color:white;font-family:Arial;text-align:center}
-img{width:90%;max-width:1000px;border:2px solid #555}
+img{width:95%;max-width:1100px;border:2px solid #555}
 button{font-size:20px;margin:10px;padding:10px 20px}
 </style>
 </head>
 <body>
-<h2>Pinky Arrow Sequence Navigation</h2>
+<h2>Pinky Road-Region Black Arrow Tracking</h2>
 <img src="/video_feed"><br>
 <button onclick="cmd('p')">START / PAUSE ('P')</button>
 <button onclick="cmd('r')">RESET ('R')</button>
@@ -212,15 +254,15 @@ def command(key):
     return "OK"
 
 # ==========================================
-# 4. 메인 실행
+# 5. 프로그램 실행
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=control_loop, daemon=True).start()
 
     print("==================================================")
-    print(" [Pinky 비전 웹 주행 서버 시작]")
-    print(f" 접속 주소: http://<라즈베리파이_IP>:{PORT}")
-    print(" 웹페이지 열린 상태에서 키보드 'p' 누르면 자동 주행 시작")
+    print(f" [핑크봇 정밀 검은색 화살표 탐색 서버 실행]")
+    print(f" 웹 접속 주소: http://<라즈베리파이_IP>:{PORT}")
+    print(" 브라우저 접속 후 키보드 'p'로 시작/정지 제어")
     print("==================================================")
 
     try:
