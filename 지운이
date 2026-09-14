@@ -1,304 +1,121 @@
 import cv2
 import numpy as np
 import time
-import sys
-import select
-import tty
-import termios
+from pinkylib import Camera, Motor
 
-# =========================================================
-# 1. 파라미터 설정 (로봇 주행 및 비전 처리)
-# =========================================================
-CAMERA_INDEX = 0
+# ==========================================
+# 1. 하드웨어 초기화 (기본 설정 연동)
+# ==========================================
+motor = Motor()
+camera = Camera()
 
-BASE_SPEED = 25          # 기본 직진 속도
-ROTATE_SPEED = 18        # 정렬 및 탐색 회전 속도
-MAX_SPEED = 40           # 최대 모터 속도
+motor.enable_motor()
+camera.start()
 
-KP_LINE = 0.12           # 라인 트래킹 P-Gain
-KP_ALIGN = 0.15          # 화살표 꼭짓점 정렬 P-Gain
-ALIGN_THRESHOLD_PX = 15  # 화면 중앙 오차 허용 범위(px)
+# 주행 파라미터 설정
+BASE_SPEED = 22
+KP = 0.15  # 조향 민감도 (필요에 따라 조절)
 
-ROI_START_RATIO = 0.58   # 관심 영역(ROI) 시작 비율
-TARGET_INDEX = 2         # 라인 트래킹 목표 점 인덱스
+auto_mode = False
 
-# HSV 색상 범위 (필드 조명에 맞게 조정 가능)
-LOWER_WHITE = np.array([0, 0, 175])
-UPPER_WHITE = np.array([180, 75, 255])
+print("프로그램이 시작되었습니다. 카메라 창을 클릭하고 'p'를 누르면 주행을 시작합니다.")
+print("종료하려면 'q'를 누르세요.")
 
-LOWER_BLACK = np.array([0, 0, 0])
-UPPER_BLACK = np.array([180, 255, 80])
-
-MIN_AREA = 500
-ARROW_MIN_AREA = 700
-ARROW_FILL_GAP_RATIO = 0.38
-
-# 화살표 중복 인식 방지 타임아웃 (초)
-ARROW_COOLDOWN = 2.0     
-
-# =========================================================
-# 2. 로봇 제어 인터페이스 (사용자 환경 하드웨어 연결)
-# =========================================================
-def set_motor_speed(left, right):
-    """
-    사용하시는 로봇의 GPIO / Serial / 드라이버 코드를 연결하세요.
-    left, right: -100 ~ 100 범위의 모터 속도
-    """
-    left = int(np.clip(left, -MAX_SPEED, MAX_SPEED))
-    right = int(np.clip(right, -MAX_SPEED, MAX_SPEED))
-    # TODO: 실제 모터 구동 명령 작성 (예: serial_write(left, right))
-    pass
-
-def stop_robot():
-    set_motor_speed(0, 0)
-
-# =========================================================
-# 3. 비전 처리 및 꼭짓점 추출 함수
-# =========================================================
-def remove_small_components(mask, min_area):
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    cleaned = np.zeros_like(mask)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_area:
-            cleaned[labels == i] = 255
-    return cleaned
-
-def fill_arrow_gaps(white_mask):
-    filled = white_mask.copy()
-    h, w = white_mask.shape
-    max_gap = int(w * ARROW_FILL_GAP_RATIO)
-    for y in range(h):
-        xs = np.where(white_mask[y] == 255)[0]
-        if len(xs) == 0:
+try:
+    while True:
+        frame = camera.get_frame()
+        if frame is None:
+            time.sleep(0.01)
             continue
-        groups = np.split(xs, np.where(np.diff(xs) > 1)[0] + 1)
-        groups = [g for g in groups if len(g) >= 25]
-        if len(groups) < 2:
-            continue
-        for i in range(len(groups) - 1):
-            left_end = int(groups[i][-1])
-            right_start = int(groups[i + 1][0])
-            gap = right_start - left_end - 1
-            if 0 < gap <= max_gap:
-                filled[y, left_end:right_start + 1] = 255
-    kernel = np.ones((3, 5), np.uint8)
-    return cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-def get_line_error(road_mask):
-    roi_h, roi_w = road_mask.shape
-    points = []
-    prev_center = None
-
-    for scan_i, y in enumerate(range(roi_h - 1, 0, -15)):
-        if scan_i >= 8:
-            break
-        xs = np.where(road_mask[y] == 255)[0]
-        if len(xs) == 0:
-            continue
-        groups = np.split(xs, np.where(np.diff(xs) > 1)[0] + 1)
-        groups = [g for g in groups if len(g) >= 25]
-        if len(groups) == 0:
-            continue
-
-        if prev_center is None:
-            chosen = min(groups, key=lambda g: abs((int(g[0]) + int(g[-1])) / 2.0 - roi_w / 2.0))
-        else:
-            chosen = min(groups, key=lambda g: abs((int(g[0]) + int(g[-1])) / 2.0 - prev_center))
-
-        x_center = (int(chosen[0]) + int(chosen[-1])) / 2.0
-        if prev_center is not None and abs(x_center - prev_center) > 60:
-            continue
-
-        points.append(x_center)
-        prev_center = x_center
-
-    if len(points) > TARGET_INDEX:
-        target_x = points[TARGET_INDEX]
-        return target_x - (roi_w / 2.0)
-    return None
-
-def find_arrow_tip(hsv_roi, road_mask):
-    black_mask = cv2.inRange(hsv_roi, LOWER_BLACK, UPPER_BLACK)
-    arrow_mask = cv2.bitwise_and(black_mask, road_mask)
-    arrow_mask = cv2.morphologyEx(arrow_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-
-    contours, _ = cv2.findContours(arrow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    c = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(c) < ARROW_MIN_AREA:
-        return None
-
-    peri = cv2.arcLength(c, True)
-    approx = cv2.approxPolyDP(c, 0.03 * peri, True)
-    pts = approx.reshape(-1, 2)
-    n_pts = len(pts)
-
-    if n_pts < 5:
-        return None
-
-    min_angle = 180.0
-    tip_pt = None
-
-    for i in range(n_pts):
-        pt_prev = pts[i - 1]
-        pt_curr = pts[i]
-        pt_next = pts[(i + 1) % n_pts]
-
-        v1 = pt_prev - pt_curr
-        v2 = pt_next - pt_curr
-
-        cosine = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
-        angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
-
-        if angle < min_angle:
-            min_angle = angle
-            tip_pt = tuple(pt_curr)
-
-    if min_angle < 85 and tip_pt is not None:
-        return tip_pt
-    return None
-
-# =========================================================
-# 4. SSH 터미널 키 입력 처리
-# =========================================================
-def get_key_non_blocking():
-    dr, _, _ = select.select([sys.stdin], [], [], 0.001)
-    if dr:
-        return sys.stdin.read(1).lower()
-    return None
-
-# =========================================================
-# 5. 메인 제어 루프
-# =========================================================
-def main():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print("카메라를 열 수 없습니다.")
-        return
-
-    old_settings = termios.tcgetattr(sys.stdin)
-    tty.setcbreak(sys.stdin.fileno())
-
-    print("==================================================")
-    print(" [SSH READY] 대기 모드 (①~⑥ 순차적 화살표 노드 제어)")
-    print(" 'p' : 주행 시작 / 일시 정지")
-    print(" 'r' : 상태 및 순서 초기화")
-    print(" 'q' : 프로그램 종료")
-    print("==================================================")
-
-    auto_mode = False
-    drive_state = "FOLLOW_LINE"
-    last_error = 0.0
-
-    arrow_step = 0              # 현재 인식할 화살표 순서 (1 ~ 6)
-    last_arrow_time = 0         # 중복 인식 방지 시각
-
-    try:
-        while True:
-            key = get_key_non_blocking()
-            if key == 'p':
-                auto_mode = not auto_mode
-                if not auto_mode:
-                    stop_robot()
-                    print("\n[PAUSE] 주행 일시 정지")
+            
+        h, w = frame.shape[:2]
+        
+        # ==========================================
+        # 2. 화살표 인식 영역(ROI) 설정 (화면 아래쪽 50%)
+        # ==========================================
+        roi_y = int(h * 0.5)
+        roi = frame[roi_y:h, 0:w]
+        
+        # ==========================================
+        # 3. 색상 기반 화살표(검은색) 검출
+        # ==========================================
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        
+        # 검은색 범위 지정 (조명에 따라 값 조정 필요)
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 70])
+        
+        mask = cv2.inRange(hsv, lower_black, upper_black)
+        
+        # 노이즈 제거 (모폴로지 연산)
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        
+        # ==========================================
+        # 4. 화살표 중심점 계산 및 방향 조절
+        # ==========================================
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            # 가장 큰 윤곽선 찾기 (화살표로 간주)
+            largest_c = max(contours, key=cv2.contourArea)
+            
+            if cv2.contourArea(largest_c) > 500:  # 너무 작은 노이즈 무시
+                # 윤곽선의 무게 중심(Centroid) 계산
+                M = cv2.moments(largest_c)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    
+                    # 화면 중앙(w/2)과 화살표 중심(cx)의 오차 계산
+                    error = cx - (w // 2)
+                    
+                    # 시각화: 중심점에 빨간 원 그리기
+                    cv2.circle(roi, (cx, cy), 5, (0, 0, 255), -1)
+                    cv2.drawContours(roi, [largest_c], -1, (0, 255, 0), 2)
+                    
+                    # 주행 모드일 때 모터 제어 (화살표 중심을 향해 회전)
+                    if auto_mode:
+                        left_speed = BASE_SPEED + int(error * KP)
+                        right_speed = BASE_SPEED - int(error * KP)
+                        
+                        # 모터 속도 제한 (-100 ~ 100)
+                        left_speed = max(min(left_speed, 100), -100)
+                        right_speed = max(min(right_speed, 100), -100)
+                        
+                        motor.move(left_speed, right_speed)
                 else:
-                    print("\n[START] 자동 주행 시작")
-            elif key == 'r':
-                auto_mode = False
-                drive_state = "FOLLOW_LINE"
-                last_error = 0.0
-                arrow_step = 0
-                last_arrow_time = 0
-                stop_robot()
-                print("\n[RESET] 상태 및 화살표 순서 초기화 (Step 0)")
-            elif key == 'q':
-                print("\n[QUIT] 프로그램 종료")
-                stop_robot()
-                break
+                    if auto_mode: motor.move(BASE_SPEED, BASE_SPEED)
+            else:
+                if auto_mode: motor.move(BASE_SPEED, BASE_SPEED)
+        else:
+            if auto_mode: motor.move(BASE_SPEED, BASE_SPEED)
 
-            ret, frame = cap.read()
-            if not ret:
-                continue
+        # ==========================================
+        # 5. 화면 출력 및 단축키 제어
+        # ==========================================
+        status_text = "AUTO: ON" if auto_mode else "AUTO: OFF (Press 'p')"
+        color = (0, 255, 0) if auto_mode else (0, 0, 255)
+        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        cv2.imshow("Robot View", frame)
+        cv2.imshow("Arrow Mask", mask)
+        
+        # 'p' 키를 누르면 주행/정지 토글 (반드시 cv2 영상 창이 선택된 상태에서 눌러야 함)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('p'):
+            auto_mode = not auto_mode
+            if not auto_mode:
+                motor.move(0, 0)
+                print("주행 정지")
+            else:
+                print("자동 주행 시작")
+        elif key == ord('q'):
+            print("프로그램 종료")
+            break
 
-            h, w = frame.shape[:2]
-            roi_start = int(h * ROI_START_RATIO)
-            roi = frame[roi_start:h, :]
-            roi_h, roi_w = roi.shape[:2]
-
-            # 비전 전처리
-            roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
-            hsv = cv2.cvtColor(roi_blur, cv2.COLOR_BGR2HSV)
-
-            white_mask = cv2.inRange(hsv, LOWER_WHITE, UPPER_WHITE)
-            white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-            white_mask = remove_small_components(white_mask, MIN_AREA)
-            road_mask = fill_arrow_gaps(white_mask)
-
-            tip_point = find_arrow_tip(hsv, road_mask)
-            line_error = get_line_error(road_mask)
-
-            current_time = time.time()
-
-            if auto_mode:
-                # -------------------------------------------------
-                # 1. 라인 추종 모드 (화살표 감지 시 정렬 모드로 전환)
-                # -------------------------------------------------
-                if drive_state == "FOLLOW_LINE":
-                    # 쿨다운 시간이 지나고 화살표가 보이면 다음 Step 진행
-                    if tip_point is not None and (current_time - last_arrow_time > ARROW_COOLDOWN):
-                        arrow_step += 1
-                        last_arrow_time = current_time
-                        stop_robot()
-                        drive_state = "ALIGN_TO_ARROW"
-                        print(f"\n[NODE REACHED] 화살표 #{arrow_step} 감지! -> 꼭짓점 정렬 모드 진입")
-
-                    else:
-                        if line_error is not None:
-                            last_error = line_error
-                            correction = KP_LINE * line_error
-                            left_spd = BASE_SPEED + correction
-                            right_spd = BASE_SPEED - correction
-                            set_motor_speed(left_spd, right_spd)
-                        else:
-                            # 라인 이탈 시 이전 오차 방향 회전 탐색
-                            if last_error < 0:
-                                set_motor_speed(0, ROTATE_SPEED)
-                            else:
-                                set_motor_speed(ROTATE_SPEED, 0)
-
-                # -------------------------------------------------
-                # 2. 화살표 꼭짓점 정렬 모드
-                # -------------------------------------------------
-                elif drive_state == "ALIGN_TO_ARROW":
-                    if tip_point is not None:
-                        tip_x, _ = tip_point
-                        error_x = tip_x - (roi_w / 2.0)
-
-                        if abs(error_x) <= ALIGN_THRESHOLD_PX:
-                            stop_robot()
-                            print(f"[ALIGN COMPLETE] 화살표 #{arrow_step} 꼭짓점 정렬 완료 -> 직진/탈출 전환")
-                            drive_state = "DRIVE_FORWARD"
-                            time.sleep(0.1)
-                        else:
-                            turn_cmd = int(error_x * KP_ALIGN)
-                            turn_cmd = int(np.clip(turn_cmd, -ROTATE_SPEED, ROTATE_SPEED))
-                            set_motor_speed(turn_cmd, -turn_cmd)
-                    else:
-                        set_motor_speed(10, -10)
-
-                # -------------------------------------------------
-                # 3. 정렬 후 탈출 직진 모드
-                # -------------------------------------------------
-                elif drive_state == "DRIVE_FORWARD":
-                    drive_state = "FOLLOW_LINE"
-                    set_motor_speed(BASE_SPEED, BASE_SPEED)
-
-    finally:
-        stop_robot()
-        cap.release()
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-if __name__ == "__main__":
-    main()
+finally:
+    motor.move(0, 0)
+    camera.stop()
+    cv2.destroyAllWindows()
