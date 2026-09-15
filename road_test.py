@@ -5,15 +5,17 @@ import threading
 from collections import deque
 from flask import Flask, Response, render_template_string
 from pinkylib import Camera, Motor, IR
+from ultralytics import YOLO
+import os
 
 # ============================================================
-# Pinky Pro - 화살표/STOP/STATION 중심선 추종
+# Pinky Pro - 화살표(OpenCV) + STOP/STATION(YOLO) 통합 주행
 #
 # 동작
 # 1) 시작: 도로 이진화만 하면서 직진
-# 2) 검은 화살표/글씨 발견 -> 화면 중앙 정렬
+# 2) 화살표는 OpenCV, STOP/STATION은 YOLO로 검출 -> 화면 중앙 정렬
 # 3) 화살표: 내부 skeleton 중심선 추종
-#    글씨: 글씨 전체 bbox 중심 추종
+#    STOP/STATION: YOLO bbox 중심 추종
 # 4) IR 센서가 검은색 감지 -> 정지
 # 5) 다음 목표가 안 보이면 오른쪽 제자리 회전하며 탐색
 # 6) 목표 발견 -> 중앙 정렬 -> 다시 직진/추종
@@ -35,6 +37,26 @@ camera.start()
 # Parameters
 # ----------------------------
 PORT = 5000
+
+# ----------------------------
+# YOLO text recognition
+# ----------------------------
+MODEL_PATH = "best.pt"
+YOLO_CONF = 0.45
+YOLO_IMGSZ = 320
+YOLO_EVERY = 3          # Raspberry Pi 부하 감소: 3프레임마다 추론
+TEXT_CLASSES = {"STOP", "STATION"}
+
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"{MODEL_PATH} 파일이 없습니다. road_test.py와 best.pt를 같은 폴더에 넣어주세요."
+    )
+
+print("Loading YOLO model...")
+yolo_model = YOLO(MODEL_PATH)
+print("YOLO model loaded.")
+print("YOLO classes:", yolo_model.names)
+
 
 # Motor speed
 STRAIGHT_SPEED = 22
@@ -63,7 +85,6 @@ BLACK_HI = np.array([180, 130, 115], dtype=np.uint8)
 # Detection
 MIN_BLACK_AREA = 350
 MIN_ARROW_AREA = 900
-MIN_TEXT_TOTAL_AREA = 600
 CENTER_TOL = 30
 
 # Control
@@ -97,6 +118,10 @@ lost_count = 0
 last_target = None
 ir_armed = True
 ir_clear_count = 0
+
+yolo_frame_count = 0
+last_yolo_text = None
+yolo_miss_count = 0
 
 # ============================================================
 # Motor helpers
@@ -308,154 +333,152 @@ def find_black_groups(black_mask):
 
     return items
 
-def detect_target(black_mask):
+def detect_arrow_target(black_mask):
     """
-    검은 표식 검출
-
-    TEXT:
-    - STOP/STATION은 글자들이 서로 떨어져 있어도 한 줄로 묶음
-    - 각 글자가 화살표처럼 하나의 큰 덩어리일 필요 없음
-    - 비슷한 y 위치에 있는 작은 검은 contour들을 가로 방향으로 clustering
-
-    ARROW:
-    - 큰 단일 연결 덩어리이면 화살표로 처리
+    기존 OpenCV 방식은 화살표만 담당.
+    STOP / STATION 글씨는 YOLO(best.pt)가 담당한다.
     """
     items = find_black_groups(black_mask)
 
     if not items:
         return None
 
-    # ========================================================
-    # 1) TEXT 후보
-    # ========================================================
-    # 글자 하나하나가 작은 조각으로 끊겨도 최대한 포함
-    chars = [
-        z for z in items
-        if z["area"] >= 18
-        and z["h"] >= 6
-        and z["w"] >= 2
-    ]
+    biggest = max(items, key=lambda z: z["area"])
 
-    # y 중심 좌표로 가까운 글자끼리 한 줄로 grouping
-    groups = []
+    if biggest["area"] < MIN_ARROW_AREA:
+        return None
 
-    for z in sorted(chars, key=lambda q: q["x"]):
-        cy = z["y"] + z["h"]/2
+    x,y,w,h = (
+        biggest["x"],
+        biggest["y"],
+        biggest["w"],
+        biggest["h"]
+    )
 
-        placed = False
+    if h < 22 or w < 18:
+        return None
 
-        for g in groups:
-            gy = np.mean([
-                a["y"] + a["h"]/2
-                for a in g
-            ])
+    single = np.zeros_like(black_mask)
 
-            gh = np.mean([a["h"] for a in g])
+    cv2.drawContours(
+        single,
+        [biggest["contour"]],
+        -1,
+        255,
+        -1
+    )
 
-            # 같은 줄이라고 볼 수 있는 y 허용범위
-            if abs(cy - gy) <= max(12, 0.8*gh):
-                g.append(z)
-                placed = True
-                break
+    skel, path, follow_point = skeleton_centerline(single)
 
-        if not placed:
-            groups.append([z])
+    if follow_point is None:
+        return None
 
-    text_candidates = []
+    return {
+        "type": "ARROW",
+        "bbox": (x,y,w,h),
+        "center": follow_point,
+        "mask": single,
+        "skeleton": skel,
+        "path": path,
+        "follow_point": follow_point
+    }
 
-    for g in groups:
-        if len(g) < 3:
+
+def detect_text_yolo(frame, ox, oy):
+    """
+    STOP / STATION은 오직 YOLO(best.pt)로만 검출한다.
+
+    반환 좌표:
+    - bbox / center : 기존 ROI 기준 주행 제어용
+    - frame_bbox    : 전체 프레임 기준, 이진화 black_mask에서
+                      글씨 영역을 제거할 때 사용
+    """
+    results = yolo_model(
+        frame,
+        imgsz=YOLO_IMGSZ,
+        conf=YOLO_CONF,
+        verbose=False
+    )
+
+    candidates = []
+
+    if not results:
+        return None
+
+    r = results[0]
+
+    if r.boxes is None:
+        return None
+
+    for box in r.boxes:
+        cls_id = int(box.cls[0])
+        conf = float(box.conf[0])
+        name = str(yolo_model.names[cls_id]).upper()
+
+        if name not in TEXT_CLASSES:
             continue
 
-        xs  = [z["x"] for z in g]
-        ys  = [z["y"] for z in g]
-        x2s = [z["x"] + z["w"] for z in g]
-        y2s = [z["y"] + z["h"] for z in g]
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
-        x1 = min(xs)
-        y1 = min(ys)
-        x2 = max(x2s)
-        y2 = max(y2s)
+        # 전체 프레임 -> ROI 상대 좌표
+        rx1 = x1 - ox
+        ry1 = y1 - oy
+        rw = x2 - x1
+        rh = y2 - y1
 
-        width = x2 - x1
-        height = y2 - y1
-        total_area = sum(z["area"] for z in g)
+        cx = ((x1 + x2) // 2) - ox
+        cy = ((y1 + y2) // 2) - oy
 
-        if height <= 0:
-            continue
-
-        aspect = width / float(height)
-
-        # STOP/STATION은 전체적으로 가로로 긴 영역
-        if (
-            total_area >= 120
-            and width >= 35
-            and height >= 8
-            and aspect >= 1.7
-        ):
-            text_candidates.append({
-                "group": g,
-                "bbox": (x1,y1,width,height),
-                "area": total_area
-            })
-
-    if text_candidates:
-        # 가장 넓고 면적 큰 한 줄 선택
-        best = max(
-            text_candidates,
-            key=lambda z: z["bbox"][2] * z["bbox"][3]
-        )
-
-        x,y,w,h = best["bbox"]
-
-        return {
-            "type": "TEXT",
-            "bbox": (x,y,w,h),
-            "center": (x+w//2, y+h//2),
+        candidates.append({
+            "type": name,
+            "bbox": (rx1, ry1, rw, rh),
+            "frame_bbox": (x1, y1, x2, y2),
+            "center": (cx, cy),
             "mask": None,
             "skeleton": None,
             "path": [],
-            "follow_point": (x+w//2, y+h//2)
-        }
+            "follow_point": (cx, cy),
+            "conf": conf
+        })
 
-    # ========================================================
-    # 2) ARROW 후보
-    # ========================================================
-    biggest = max(items, key=lambda z: z["area"])
+    if not candidates:
+        return None
 
-    if biggest["area"] >= MIN_ARROW_AREA:
-        x,y,w,h = (
-            biggest["x"],
-            biggest["y"],
-            biggest["w"],
-            biggest["h"]
-        )
+    # 여러 글씨가 동시에 보이면 화면 아래쪽(더 가까운 것) 우선
+    return max(candidates, key=lambda z: z["center"][1])
 
-        if h >= 22 and w >= 18:
-            single = np.zeros_like(black_mask)
 
-            cv2.drawContours(
-                single,
-                [biggest["contour"]],
-                -1,
-                255,
-                -1
-            )
+def remove_yolo_text_from_black_mask(black_mask, text_target, ox, oy):
+    """
+    YOLO가 STOP/STATION으로 잡은 영역을 black_mask에서 완전히 제거한다.
 
-            skel, path, follow_point = skeleton_centerline(single)
+    따라서 OpenCV 이진화는 글씨를 절대 목표로 쓰지 않고,
+    화살표 검출에만 사용된다.
+    """
+    if text_target is None:
+        return black_mask
 
-            if follow_point is not None:
-                return {
-                    "type": "ARROW",
-                    "bbox": (x,y,w,h),
-                    "center": follow_point,
-                    "mask": single,
-                    "skeleton": skel,
-                    "path": path,
-                    "follow_point": follow_point
-                }
+    clean = black_mask.copy()
 
-    return None
+    x1, y1, x2, y2 = text_target["frame_bbox"]
+
+    # 전체 프레임 좌표 -> ROI 좌표
+    rx1 = max(0, x1 - ox)
+    ry1 = max(0, y1 - oy)
+    rx2 = min(clean.shape[1], x2 - ox)
+    ry2 = min(clean.shape[0], y2 - oy)
+
+    if rx2 > rx1 and ry2 > ry1:
+        # bbox 주변에 약간의 여유를 두어 글자 조각까지 제거
+        pad = 8
+        rx1 = max(0, rx1 - pad)
+        ry1 = max(0, ry1 - pad)
+        rx2 = min(clean.shape[1], rx2 + pad)
+        ry2 = min(clean.shape[0], ry2 + pad)
+
+        clean[ry1:ry2, rx1:rx2] = 0
+
+    return clean
 
 # ============================================================
 # Visualization
@@ -521,9 +544,14 @@ def draw_target(vis, target, ox, oy):
         2
     )
 
+    label = target["type"]
+
+    if "conf" in target:
+        label = f'{label} {target["conf"]:.2f}'
+
     cv2.putText(
         vis,
-        target["type"],
+        label,
         (x+ox,max(20,y+oy-8)),
         cv2.FONT_HERSHEY_SIMPLEX,
         .55,
@@ -541,6 +569,7 @@ def control_loop():
     global ir_armed, ir_clear_count
     global lost_count, last_target
     global ir_armed, ir_clear_count
+    global yolo_frame_count, last_yolo_text, yolo_miss_count
 
     ir_stop_time = 0.0
 
@@ -558,7 +587,55 @@ def control_loop():
         roi, ox, oy = get_roi(frame)
         white_mask, black_mask, road_region = make_masks(roi)
 
-        target = detect_target(black_mask)
+        # ----------------------------------------------------
+        # STOP/STATION: YOLO만 사용
+        # ARROW       : OpenCV 이진화 + skeleton만 사용
+        #
+        # 중요:
+        # YOLO가 잡은 글씨 영역은 black_mask에서 지운 뒤
+        # 화살표 검출을 수행한다.
+        # 따라서 글씨 이진화와 YOLO가 서로 충돌하지 않는다.
+        # ----------------------------------------------------
+        yolo_frame_count += 1
+
+        if yolo_frame_count % YOLO_EVERY == 0:
+            try:
+                detected_text = detect_text_yolo(frame, ox, oy)
+
+                if detected_text is not None:
+                    last_yolo_text = detected_text
+                    yolo_miss_count = 0
+                else:
+                    yolo_miss_count += 1
+
+                    # 잠깐의 YOLO 미검출은 이전 bbox 유지
+                    if yolo_miss_count >= 3:
+                        last_yolo_text = None
+
+            except Exception as e:
+                print("YOLO ERROR:", e)
+
+        text_target = last_yolo_text
+
+        # YOLO 글씨 영역을 이진화 마스크에서 제거
+        arrow_black_mask = remove_yolo_text_from_black_mask(
+            black_mask,
+            text_target,
+            ox,
+            oy
+        )
+
+        # OpenCV 이진화는 이제 화살표만 검출
+        arrow_target = detect_arrow_target(arrow_black_mask)
+
+        # STOP/STATION이 보이면 YOLO 글씨를 우선 목표로 사용.
+        # 글씨가 없을 때만 화살표를 사용.
+        if text_target is not None:
+            target = text_target
+        elif arrow_target is not None:
+            target = arrow_target
+        else:
+            target = None
 
         ir_l, ir_c, ir_r = ir.read_ir()
         ir_hit = (
@@ -607,7 +684,7 @@ def control_loop():
 
             # ====================================================
             # ALIGN
-            # 화살표/글씨 중심을 화면 가운데로 정렬
+            # 화살표 또는 YOLO STOP/STATION 중심을 화면 가운데로 정렬
             # ====================================================
             elif state == "ALIGN":
                 if target is None:
@@ -637,7 +714,7 @@ def control_loop():
 
             # ====================================================
             # FOLLOW
-            # 화살표는 skeleton 중심선 / 글씨는 bbox 중심 추종
+            # 화살표는 skeleton 중심선 / STOP·STATION은 YOLO bbox 중심 추종
             # ====================================================
             elif state == "FOLLOW":
                 if ir_armed and ir_hit:
@@ -690,7 +767,7 @@ def control_loop():
             # 다음 목표가 안 보이면 오른쪽 제자리 회전
             # ====================================================
             elif state == "SEARCH_RIGHT":
-                # 오른쪽으로 회전하면서 화살표 또는 글씨 둘 다 탐색
+                # 오른쪽으로 회전하면서 화살표 또는 YOLO STOP/STATION 탐색
                 if target is not None:
                     stop_robot()
                     last_target = target
@@ -767,7 +844,7 @@ def control_loop():
         )
 
         # binary preview
-        binary_bgr = cv2.cvtColor(black_mask, cv2.COLOR_GRAY2BGR)
+        binary_bgr = cv2.cvtColor(arrow_black_mask, cv2.COLOR_GRAY2BGR)
         binary_bgr = cv2.resize(
             binary_bgr,
             (vis.shape[1], vis.shape[0]),
@@ -805,7 +882,7 @@ button{font-size:24px;margin:5px;padding:10px 20px}
 </style>
 </head>
 <body>
-<h2>Pinky Arrow / STOP / STATION Tracking</h2>
+<h2>Pinky Arrow(OpenCV) + STOP/STATION(YOLO)</h2>
 <img src="/video_feed">
 <div>
 <button onclick="cmd('w')">W</button>
