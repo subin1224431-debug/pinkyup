@@ -94,7 +94,7 @@ MAX_CORR = 10
 
 # Search behavior
 IR_STOP_SEC = 0.45
-IR_AFTER_HIT_DRIVE_SEC = 1.0   # IR 감지 후 1초 더 직진한 뒤 정지
+IR_AFTER_HIT_DRIVE_SEC = 1.3   # IR 감지 후 1.3초 더 직진한 뒤 정지
 IR_CLEAR_FRAMES = 4   # 검은 표식에서 벗어난 것이 연속 4프레임 확인되면 IR 재활성화
 LOST_TARGET_FRAMES = 5
 
@@ -122,6 +122,10 @@ ir_clear_count = 0
 yolo_frame_count = 0
 last_yolo_text = None
 yolo_miss_count = 0
+last_stable_yolo_text = None
+YOLO_EDGE_MARGIN = 18
+YOLO_STABLE_HOLD = 4
+yolo_partial_count = 0
 
 # ============================================================
 # Motor helpers
@@ -388,10 +392,14 @@ def detect_text_yolo(frame, ox, oy):
     """
     STOP / STATION은 오직 YOLO(best.pt)로만 검출한다.
 
-    반환 좌표:
+    중요:
+    글씨가 화면 가장자리에서 잘린 상태라면 bbox 중심이 실제 글씨 중심이 아니므로
+    그 중심값으로 조향하지 않는다.
+
+    반환:
     - bbox / center : 기존 ROI 기준 주행 제어용
-    - frame_bbox    : 전체 프레임 기준, 이진화 black_mask에서
-                      글씨 영역을 제거할 때 사용
+    - frame_bbox    : 전체 프레임 기준
+    - clipped       : 화면 가장자리에서 잘린 검출인지 여부
     """
     results = yolo_model(
         frame,
@@ -410,6 +418,8 @@ def detect_text_yolo(frame, ox, oy):
     if r.boxes is None:
         return None
 
+    fh, fw = frame.shape[:2]
+
     for box in r.boxes:
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
@@ -419,6 +429,14 @@ def detect_text_yolo(frame, ox, oy):
             continue
 
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+        # 화면 가장자리에 붙으면 글씨 일부가 잘린 것으로 판단
+        clipped = (
+            x1 <= YOLO_EDGE_MARGIN or
+            y1 <= YOLO_EDGE_MARGIN or
+            x2 >= fw - YOLO_EDGE_MARGIN or
+            y2 >= fh - YOLO_EDGE_MARGIN
+        )
 
         # 전체 프레임 -> ROI 상대 좌표
         rx1 = x1 - ox
@@ -438,15 +456,15 @@ def detect_text_yolo(frame, ox, oy):
             "skeleton": None,
             "path": [],
             "follow_point": (cx, cy),
-            "conf": conf
+            "conf": conf,
+            "clipped": clipped
         })
 
     if not candidates:
         return None
 
-    # 여러 글씨가 동시에 보이면 화면 아래쪽(더 가까운 것) 우선
+    # 화면 아래쪽 = 로봇에 가까운 글씨 우선
     return max(candidates, key=lambda z: z["center"][1])
-
 
 def remove_yolo_text_from_black_mask(black_mask, text_target, ox, oy):
     """
@@ -549,6 +567,9 @@ def draw_target(vis, target, ox, oy):
     if "conf" in target:
         label = f'{label} {target["conf"]:.2f}'
 
+    if target.get("clipped", False):
+        label += " PARTIAL"
+
     cv2.putText(
         vis,
         label,
@@ -570,6 +591,7 @@ def control_loop():
     global lost_count, last_target
     global ir_armed, ir_clear_count
     global yolo_frame_count, last_yolo_text, yolo_miss_count
+    global last_stable_yolo_text, yolo_partial_count
 
     ir_stop_time = 0.0
 
@@ -603,14 +625,36 @@ def control_loop():
                 detected_text = detect_text_yolo(frame, ox, oy)
 
                 if detected_text is not None:
-                    last_yolo_text = detected_text
                     yolo_miss_count = 0
+
+                    if not detected_text.get("clipped", False):
+                        # 글씨 전체가 화면 안에 들어온 정상 검출만
+                        # 실제 조향 중심으로 저장
+                        last_stable_yolo_text = detected_text
+                        last_yolo_text = detected_text
+                        yolo_partial_count = 0
+
+                    else:
+                        # 글씨가 잘린 상태:
+                        # 보이는 조각의 중심으로 새로 조향하지 않는다.
+                        yolo_partial_count += 1
+
+                        if last_stable_yolo_text is not None:
+                            # 직전 정상 bbox 중심 유지
+                            last_yolo_text = last_stable_yolo_text
+                        else:
+                            # 아직 정상 bbox를 한 번도 못 봤으면
+                            # 글씨를 목표로 쓰지 않고 계속 현재 주행 유지
+                            last_yolo_text = None
+
                 else:
                     yolo_miss_count += 1
 
-                    # 잠깐의 YOLO 미검출은 이전 bbox 유지
-                    if yolo_miss_count >= 3:
+                    # 잠깐의 YOLO 미검출은 이전 정상 bbox 유지
+                    if yolo_miss_count >= YOLO_STABLE_HOLD:
                         last_yolo_text = None
+                        last_stable_yolo_text = None
+                        yolo_partial_count = 0
 
             except Exception as e:
                 print("YOLO ERROR:", e)
@@ -719,7 +763,7 @@ def control_loop():
             elif state == "FOLLOW":
                 if ir_armed and ir_hit:
                     # IR이 검은 표식을 처음 감지하면 바로 멈추지 않고
-                    # 1초간 더 직진하여 표식을 완전히 통과
+                    # 1.3초간 더 직진하여 표식을 완전히 통과
                     ir_armed = False
                     ir_clear_count = 0
                     ir_stop_time = time.time()
@@ -742,7 +786,7 @@ def control_loop():
 
             elif state == "IR_CONTINUE":
                 # 기존 검은 글씨/화살표를 벗어나기 위해
-                # IR 감지 후 1초간 추가 직진
+                # IR 감지 후 1.3초간 추가 직진
                 if time.time() - ir_stop_time < IR_AFTER_HIT_DRIVE_SEC:
                     drive(FOLLOW_SPEED, FOLLOW_SPEED)
                 else:
@@ -758,7 +802,7 @@ def control_loop():
                 stop_robot()
 
                 if time.time() - ir_stop_time >= IR_STOP_SEC:
-                    # 1초 더 주행해서 이전 표식을 벗어난 뒤이므로
+                    # 1.3초 더 주행해서 이전 표식을 벗어난 뒤이므로
                     # 다음 표식은 오른쪽 회전하면서 다시 탐색
                     state = "SEARCH_RIGHT"
 
