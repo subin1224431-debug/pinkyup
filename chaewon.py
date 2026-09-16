@@ -104,26 +104,31 @@ IR_CLEAR_FRAMES = 4            # 검은 표식에서 벗어난 것이 연속 4�
 LOST_TARGET_FRAMES = 5
 
 # ------------------------------------------------------------
-# 3번째 화살표 기반 우회전 타이밍
+# 카운트 2 이후 거리 기반 직진 설정
 # ------------------------------------------------------------
-# 3번째 화살표는 IR로 밟지 않는다.
-# 화살표 bbox의 아래쪽 끝(y+h)이 ROI 높이의 이 비율까지 내려오면 우회전을 시작한다.
-# 더 일찍 돌고 싶으면 값을 낮추고(예: 0.68), 더 늦게 돌고 싶으면 높인다(예: 0.80).
-THIRD_ARROW_TURN_RATIO = 0.75
+# 화살표 카운트는 이제 "화살표를 봤을 때"가 아니라 IR 센서가 실제로 밟았을 때만 증가한다.
+#
+# 카운트 2가 된 뒤에는 바로 우회전하지 않고, 앞쪽에 보이는 다음 화살표를
+# 거리 기준점으로 사용해 조금 더 직진한다. 실제 거리센서가 아니므로 카메라 영상에서
+# 화살표 bbox의 아래쪽 끝(y+h)을 ROI 높이로 나눈 비율을 거리 대용값으로 쓴다.
+#
+# 값이 작을수록 화살표가 멀리 있을 때 일찍 우회전하고,
+# 값이 클수록 화살표에 더 가까이 간 뒤 늦게 우회전한다.
+# 예: 0.55 -> 일찍, 0.65 -> 중간, 0.75 -> 늦게
+SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.68
 
-# bbox 흔들림 때문에 한 프레임만 잘못 내려오는 것을 막기 위해
-# 연속 N프레임 기준선을 넘었을 때만 실제 우회전한다.
-THIRD_ARROW_TRIGGER_FRAMES = 2
+# 카운트 2를 밟은 직후 화면 아래에 남아 있는 "방금 밟은 화살표"와
+# 앞쪽의 다음 화살표를 구분하기 위한 점프 기준. ROI 높이의 이 비율 이상
+# bbox 하단이 위쪽으로 점프하면 앞쪽의 새 화살표로 간주한다.
+SECOND_NEXT_ARROW_SWITCH_JUMP_RATIO = 0.10
 
-# 2번째 화살표를 IR로 밟은 직후 화면 아래쪽에 남아 있던 2번 화살표가 사라지고
-# 더 먼 3번 화살표로 대상이 바뀌면 bbox 하단이 위쪽으로 크게 점프한다.
-# ROI 높이의 이 비율만큼 위로 점프하면 새 3번 화살표로 인정한다.
-THIRD_ARROW_SWITCH_JUMP_RATIO = 0.10
+# 거리 기준용 다음 화살표를 추종하며 직진할 때 속도/보정값
+SECOND_COUNT_FORWARD_SPEED = 17
+SECOND_COUNT_FORWARD_KP = 0.08
+SECOND_COUNT_FORWARD_MAX_CORR = 7
 
-# 3번째 화살표를 향해 접근할 때는 너무 빠르게 가지 않도록 별도 속도 사용
-THIRD_ARROW_SPEED = 17
-THIRD_ARROW_KP = 0.08
-THIRD_ARROW_MAX_CORR = 7
+# 거리 기준선이 흔들려 한 프레임만 넘는 오검출을 막기 위한 연속 프레임 수
+SECOND_COUNT_TRIGGER_FRAMES = 2
 
 # Stream
 JPEG_QUALITY = 55
@@ -165,12 +170,9 @@ TEXT_MAX_JUMP = 180          # 실제 이동은 허용하고 비정상적인 큰
 # ----------------------------
 blob_count = 0
 
-# 같은 화살표를 여러 번 세지 않기 위한 상태
-# count_armed=True일 때만 새 Blob을 카운트한다.
+# 카운트는 IR 센서가 실제 화살표를 밟았을 때만 증가한다.
+# 같은 검은 표식을 여러 번 세지 않는 역할은 ir_armed가 담당한다.
 blob_count_armed = True
-
-# 한 번 카운트한 Blob은 IR을 실제로 밟은 뒤,
-# 그 Blob이 화면에서 충분히 사라져야 다음 카운트를 허용한다.
 blob_ir_passed = False
 blob_missing_frames = 0
 
@@ -179,12 +181,10 @@ ir_blob_count = 0
 # 오른쪽 회전 허용 플래그
 search_right_allowed = False
 
-# 3번째 화살표 하단이 기준선을 넘은 연속 프레임 수
-third_arrow_trigger_count = 0
-
-# 2번째 화살표 IR 순간의 bbox 하단 위치.
-# 2번 -> 3번 화살표 전환을 구분하는 보조 기준으로 사용.
+# 카운트 2 이후 거리 기반 직진용 상태값
+second_forward_trigger_count = 0
 second_ir_arrow_bottom = None
+second_reference_acquired = False
 
 # ============================================================
 # Motor helpers
@@ -903,7 +903,8 @@ def control_loop():
     global yolo_frame_count, last_yolo_text, yolo_miss_count
     global last_stable_yolo_text, yolo_partial_count, last_text_mask_targets
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
-    global search_right_allowed, third_arrow_trigger_count, second_ir_arrow_bottom
+    global search_right_allowed
+    global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     ir_stop_time = 0.0
 
@@ -978,89 +979,30 @@ def control_loop():
         arrow_target = detect_arrow_target(arrow_black_mask)
 
         # ----------------------------------------------------
-        # 화살표 Blob 카운팅
+        # 화살표 카운팅
         #
-        # 핵심:
-        # 1) 새 Blob이 처음 잡히면 딱 1번만 카운트
-        # 2) 같은 화살표가 흔들리거나 잠깐 끊겨 보여도 재카운트 금지
-        # 3) 그 Blob을 따라가서 IR 센서를 실제로 밟은 뒤에만
-        #    다음 카운트를 준비할 수 있음
-        # 4) IR이 다시 clear되어 ir_armed=True가 되고,
-        #    기존 Blob도 충분한 프레임 동안 완전히 사라져야
-        #    다음 Blob 카운트를 허용
+        # 중요: 여기서는 화살표를 "검출"해도 카운트하지 않는다.
+        # blob_count는 아래 FOLLOW 상태에서 IR 센서가 실제 화살표를 밟았을 때만 증가한다.
         # ----------------------------------------------------
-        if arrow_target is not None:
-            blob_missing_frames = 0
-
-            if blob_count_armed:
-                blob_count += 1
-                blob_count_armed = False
-                blob_ir_passed = False
-                print(f"[BLOB COUNT] {blob_count}")
-
-        else:
-            # 다음 카운트는 반드시:
-            #   이전 Blob IR 통과 완료
-            #   + IR 센서 clear 후 재활성화
-            #   + 이전 Blob이 화면에서 완전히 사라짐
-            # 세 조건을 모두 만족해야 허용한다.
-            if (
-                blob_ir_passed
-                and ir_armed
-                and not blob_count_armed
-            ):
-                blob_missing_frames += 1
-
-                if blob_missing_frames >= BLOB_GONE_FRAMES:
-                    blob_count_armed = True
-                    blob_ir_passed = False
-                    blob_missing_frames = 0
-                    print("[BLOB] previous blob fully passed -> next count armed")
-            else:
-                # 조건이 아직 안 됐으면 누적하지 않음
-                blob_missing_frames = 0
 
         # ----------------------------------------------------
         # 목표 선택
-        #
-        # 평상시:
-        #   STOP / STATION / 화살표 Blob 중 더 가까운 목표 선택
-        #
-        # 단, Blob을 이미 카운트했고 아직 그 Blob의 IR을 밟지 않았다면:
-        #   그 순간부터는 현재 Blob만 추종
-        #   STOP/STATION은 보여도 무시
-        #
-        # 따라서 2번째 Blob을 인식한 뒤 IR을 밟기 전에
-        # 앞쪽 STOP이 보여도 STOP으로 목표가 바뀌지 않는다.
         # ----------------------------------------------------
-        waiting_for_blob_ir = (
-            blob_count >= 1
-            and not blob_count_armed
-            and not blob_ir_passed
-        )
-
-        # 오른쪽 교차로 진입 중에는 STOP만 사용한다.
-        # STATION이나 남아 있는 3번째 화살표 때문에 회전이 끊기는 것을 막는다.
         stop_target = None
         if text_target is not None and text_target.get("type") == "STOP":
             stop_target = text_target
 
-        if state in ("FIRST_BLOB_STRAIGHT", "SECOND_BLOB_STRAIGHT", "THIRD_ARROW_APPROACH"):
-            # 1번 통과 후 2번 탐색 / 2번 통과 후 3번 탐색 / 3번 접근 중에는
+        if state in ("FIRST_BLOB_STRAIGHT", "SECOND_COUNT_DISTANCE_DRIVE"):
+            # 카운트 1 이후 다음 화살표 탐색 / 카운트 2 이후 거리 기준 직진 중에는
             # STOP/STATION을 무시하고 화살표만 본다.
             target = arrow_target
 
         elif state in ("SEARCH_STOP_RIGHT", "ALIGN_STOP"):
-            # 교차로 우회전 구간에서는 오직 STOP만 목표로 인정한다.
+            # 우회전 후에는 STOP만 목표로 인정한다.
             target = stop_target
 
-        elif waiting_for_blob_ir:
-            # 1번/2번 화살표는 IR을 실제로 밟기 전까지 화살표만 추종한다.
-            # 3번 화살표는 THIRD_ARROW_APPROACH 상태에서 IR 대신 화면 기준선을 사용한다.
-            target = arrow_target
-
         else:
-            # 그 외 구간은 기존처럼 화면에서 더 가까운 목표 선택
+            # 평상시는 기존처럼 화면에서 더 가까운 목표를 사용한다.
             visible_targets = []
 
             if text_target is not None:
@@ -1156,61 +1098,60 @@ def control_loop():
 
             # ====================================================
             # FOLLOW
-            # 화살표는 가장 큰 Blob 무게중심 / STOP·STATION은 YOLO bbox 중심 추종
+            # 화살표는 Blob 중심 / STOP·STATION은 YOLO bbox 중심 추종
+            # 화살표 카운트는 IR을 실제로 밟은 순간에만 증가한다.
             # ====================================================
             elif state == "FOLLOW":
-                if ir_armed and ir_hit:
-                    # IR을 실제로 밟기 전에는 회전 허용 안 함
+                # IR 카운팅은 현재 실제 주행 목표가 화살표일 때만 수행한다.
+                # STOP/STATION 글씨를 밟았을 때 blob_count가 증가하는 것을 방지한다.
+                following_arrow = (target is not None and target.get("type") == "ARROW")
+
+                if ir_armed and ir_hit and following_arrow:
                     search_right_allowed = False
 
-                    # ------------------------------------------------
-                    # 중요:
-                    # Blob이 화면에 잡혀 카운트된 것만으로는 절대 회전하지 않는다.
-                    # 반드시 그 Blob을 따라간 뒤 IR 센서를 실제로 밟아야
-                    # 다음 단계로 넘어간다.
-                    # ------------------------------------------------
+                    # ---- 핵심 변경 ----
+                    # 화면 인식 시점이 아니라 IR 센서가 화살표를 실제로 밟은 순간 카운트
+                    blob_count += 1
                     ir_blob_count = blob_count
-                    blob_ir_passed = True
+                    print(f"[IR ARROW COUNT] {blob_count}")
 
                     ir_armed = False
                     ir_clear_count = 0
 
                     # ------------------------------------------------
-                    # 첫 번째 Blob:
-                    # IR을 밟아도 정지/회전하지 않고 그대로 직진.
-                    # 기존 Blob이 사라진 뒤 다음 Blob 카운트를 허용한다.
+                    # 카운트 1:
+                    # 회전하지 않고 그대로 직진하며 다음 화살표를 찾는다.
                     # ------------------------------------------------
                     if ir_blob_count == 1:
                         state = "FIRST_BLOB_STRAIGHT"
 
                     # ------------------------------------------------
-                    # 두 번째 Blob:
-                    # IR을 밟은 뒤에는 아직 우회전하지 않는다.
-                    # 그대로 직진하며 3번째 화살표를 찾는다.
+                    # 카운트 2:
+                    # 기존의 '1초 직진 후 우회전'을 사용하지 않는다.
+                    # 앞쪽에 보이는 다음 화살표와의 영상상 거리를 기준으로 직진한다.
                     # ------------------------------------------------
                     elif ir_blob_count == 2:
-                        third_arrow_trigger_count = 0
+                        second_forward_trigger_count = 0
+                        second_reference_acquired = False
 
-                        # 2번째 화살표를 실제로 밟은 순간의 bbox 하단 위치 저장.
-                        # 이후 화면 아래의 2번 화살표가 빠지고, 더 먼 3번 화살표가
-                        # 선택되면서 bbox 하단이 위로 점프하는 것을 이용한다.
+                        # 방금 밟은 2번 화살표 bbox 하단을 저장해서
+                        # 이후 앞쪽의 새 화살표로 target이 바뀌는 시점을 구분한다.
                         if arrow_target is not None:
                             ax, ay, aw, ah = arrow_target["bbox"]
                             second_ir_arrow_bottom = ay + ah
                         else:
                             second_ir_arrow_bottom = None
 
-                        state = "SECOND_BLOB_STRAIGHT"
+                        state = "SECOND_COUNT_DISTANCE_DRIVE"
+                        print("[COUNT 2] distance-based forward drive")
 
-                    # 3번째 화살표는 원칙적으로 IR을 밟기 전에 화면 기준선에서
-                    # 우회전해야 하므로 여기까지 들어오면 너무 늦은 상황이다.
-                    # 안전하게 기존 후속 동작으로 넘긴다.
+                    # ------------------------------------------------
+                    # 카운트 3 이상:
+                    # 기존 로직 유지: IR -> 1초 직진 -> 정지 -> 우회전 -> YOLO 탐색
+                    # ------------------------------------------------
                     elif ir_blob_count >= 3:
                         ir_stop_time = time.time()
                         state = "IR_CONTINUE"
-
-                    else:
-                        drive(FOLLOW_SPEED, FOLLOW_SPEED)
 
                 elif target is not None:
                     last_target = target
@@ -1229,115 +1170,87 @@ def control_loop():
 
             # ====================================================
             # FIRST BLOB STRAIGHT
-            # 첫 번째 Blob에서 IR을 밟은 뒤에는 회전하지 않고 직진.
-            # 기존 Blob이 사라지면 카운트가 다시 활성화되고,
-            # 다음 Blob이 보일 때 BLOB_COUNT가 2가 된다.
+            # 카운트 1 이후에는 회전하지 않고 다음 화살표까지 직진한다.
+            # 카운트는 여기서 증가하지 않으며, 다음 화살표를 IR로 밟을 때 2가 된다.
             # ====================================================
             elif state == "FIRST_BLOB_STRAIGHT":
-                # 첫 번째 Blob의 IR을 통과한 뒤에는
-                # 반드시 "다음 Blob"을 먼저 찾아야 한다.
-                # 멀리 STOP/STATION이 보여도 이 단계에서는 전부 무시한다.
                 drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
 
-                # 두 번째 Blob이 실제로 새로 카운트되고 보일 때만
-                # 그 Blob으로 ALIGN/FOLLOW 한다.
-                if blob_count >= 2 and arrow_target is not None:
-                    stop_robot()
-                    last_target = arrow_target
-                    lost_count = 0
-                    state = "ALIGN"
+                # IR이 다시 흰 바닥에서 재활성화된 뒤 보이는 화살표를
+                # 다음 화살표로 보고 ALIGN/FOLLOW로 복귀한다.
+                if ir_armed and arrow_target is not None:
+                    ax, ay, aw, ah = arrow_target["bbox"]
+                    arrow_bottom = ay + ah
+
+                    # 방금 밟은 화살표가 화면 맨 아래에 남아 있는 동안은 무시.
+                    # ROI 아래 88%보다 위쪽에 있는 화살표부터 '앞쪽 화살표'로 인정한다.
+                    if arrow_bottom <= int(roi.shape[0] * 0.88):
+                        stop_robot()
+                        last_target = arrow_target
+                        lost_count = 0
+                        state = "ALIGN"
+                        print("[COUNT 1] next arrow acquired")
 
             # ====================================================
-            # SECOND BLOB STRAIGHT
-            # 2번째 화살표를 IR로 통과한 뒤에는 우회전하지 않는다.
-            # 직진하며 3번째 화살표가 새 Blob으로 카운트될 때까지 기다린다.
+            # SECOND COUNT DISTANCE DRIVE
+            # 카운트 2 이후에는 고정 1초가 아니라 앞 화살표와의 화면상 거리로
+            # 직진 종료 시점을 정한다. 이 화살표는 '거리 기준점'일 뿐 카운트하지 않는다.
             # ====================================================
-            elif state == "SECOND_BLOB_STRAIGHT":
-                drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
-
-                # 기존 방식처럼 화살표 사이에 빈 프레임이 충분하면 blob_count가 3이 된다.
-                # 하지만 2번과 3번이 카메라에 연속해서 보일 수도 있으므로,
-                # 2번 IR 순간의 bbox 하단보다 현재 화살표 하단이 크게 위로 점프하면
-                # '가까운 2번이 빠지고 먼 3번으로 대상이 바뀌었다'고 판단한다.
-                third_arrow_ready = False
-
+            elif state == "SECOND_COUNT_DISTANCE_DRIVE":
+                # 우선 기본은 직진. 앞 화살표가 안정적으로 잡히면 약하게 중심 추종한다.
                 if arrow_target is not None:
                     ax, ay, aw, ah = arrow_target["bbox"]
                     current_bottom = ay + ah
-                    switch_jump_px = int(roi.shape[0] * THIRD_ARROW_SWITCH_JUMP_RATIO)
 
-                    if blob_count >= 3:
-                        third_arrow_ready = True
+                    # 방금 밟은 2번 화살표가 화면에서 빠지고
+                    # 더 먼 앞 화살표로 target이 바뀌었는지 먼저 확인한다.
+                    if not second_reference_acquired:
+                        switch_jump_px = int(roi.shape[0] * SECOND_NEXT_ARROW_SWITCH_JUMP_RATIO)
 
-                    elif (
-                        ir_armed
-                        and second_ir_arrow_bottom is not None
-                        and current_bottom <= second_ir_arrow_bottom - switch_jump_px
-                    ):
-                        # 빈 프레임 없이 바로 3번이 나타난 경우 수동으로 3번째 카운트 확정
-                        blob_count = 3
-                        blob_count_armed = False
-                        blob_ir_passed = False
-                        third_arrow_ready = True
-                        print(
-                            f"[BLOB COUNT] 3 (switch detected: "
-                            f"{second_ir_arrow_bottom} -> {current_bottom})"
-                        )
+                        if (
+                            ir_armed
+                            and (
+                                second_ir_arrow_bottom is None
+                                or current_bottom <= second_ir_arrow_bottom - switch_jump_px
+                            )
+                        ):
+                            second_reference_acquired = True
+                            print(f"[COUNT 2] reference arrow acquired, bottom={current_bottom}")
 
-                if third_arrow_ready:
-                    third_arrow_trigger_count = 0
-                    last_target = arrow_target
-                    state = "THIRD_ARROW_APPROACH"
-                    print("[3RD ARROW] detected -> visual turn trigger active")
+                    if second_reference_acquired:
+                        trigger_y = int(roi.shape[0] * SECOND_COUNT_FORWARD_TRIGGER_RATIO)
 
-            # ====================================================
-            # THIRD ARROW APPROACH
-            # 3번째 화살표는 IR로 밟지 않는다.
-            # bbox의 아래쪽 끝이 가상의 TURN LINE에 도달하면 즉시 우회전 단계로 간다.
-            # ====================================================
-            elif state == "THIRD_ARROW_APPROACH":
-                if arrow_target is not None:
-                    last_target = arrow_target
+                        # 앞 화살표가 화면 아래쪽으로 내려올수록 로봇과 가까워진다.
+                        if current_bottom >= trigger_y:
+                            second_forward_trigger_count += 1
+                        else:
+                            second_forward_trigger_count = 0
 
-                    ax, ay, aw, ah = arrow_target["bbox"]
-                    arrow_bottom = ay + ah
-                    turn_line = int(roi.shape[0] * THIRD_ARROW_TURN_RATIO)
-
-                    # 기준선에 닿기 전까지는 3번째 화살표 중심을 약하게 추종하며 접근
-                    target_x = arrow_target["center"][0] + ox
-                    error = target_x - (w / 2)
-
-                    if arrow_bottom >= turn_line:
-                        third_arrow_trigger_count += 1
+                        if second_forward_trigger_count >= SECOND_COUNT_TRIGGER_FRAMES:
+                            stop_robot()
+                            search_right_allowed = True
+                            second_forward_trigger_count = 0
+                            state = "SEARCH_STOP_RIGHT"
+                            print(
+                                f"[COUNT 2] reference bottom={current_bottom}, "
+                                f"trigger={trigger_y} -> SEARCH STOP RIGHT"
+                            )
+                        else:
+                            target_x = arrow_target["center"][0] + ox
+                            error = target_x - (w / 2)
+                            p_drive(
+                                error,
+                                SECOND_COUNT_FORWARD_SPEED,
+                                SECOND_COUNT_FORWARD_KP,
+                                SECOND_COUNT_FORWARD_MAX_CORR
+                            )
                     else:
-                        third_arrow_trigger_count = 0
-
-                    if third_arrow_trigger_count >= THIRD_ARROW_TRIGGER_FRAMES:
-                        stop_robot()
-                        search_right_allowed = True
-
-                        # 3번째 화살표는 IR 대신 시각 트리거로 완료 처리.
-                        # 이후 화살표가 사라지면 다음 Blob을 다시 셀 수 있게 한다.
-                        blob_ir_passed = True
-                        third_arrow_trigger_count = 0
-
-                        state = "SEARCH_STOP_RIGHT"
-                        print(
-                            f"[3RD ARROW] bottom={arrow_bottom}, "
-                            f"turn_line={turn_line} -> TURN RIGHT"
-                        )
-                    else:
-                        p_drive(
-                            error,
-                            THIRD_ARROW_SPEED,
-                            THIRD_ARROW_KP,
-                            THIRD_ARROW_MAX_CORR
-                        )
+                        drive(SECOND_COUNT_FORWARD_SPEED, SECOND_COUNT_FORWARD_SPEED)
 
                 else:
-                    # 잠깐 검출을 놓쳐도 급하게 돌지 않고 천천히 직진하며 다시 찾음
-                    third_arrow_trigger_count = 0
-                    drive(THIRD_ARROW_SPEED, THIRD_ARROW_SPEED)
+                    # 다음 화살표가 아직 안 보이면 그대로 천천히 직진하며 탐색
+                    second_forward_trigger_count = 0
+                    drive(SECOND_COUNT_FORWARD_SPEED, SECOND_COUNT_FORWARD_SPEED)
 
             # ====================================================
             # SEARCH STOP RIGHT
@@ -1412,9 +1325,10 @@ def control_loop():
                     drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
                     state = "FOLLOW"
 
-                elif target is not None:
+                # 카운트 3 이상 기존 후속 구간: 우회전하면서 YOLO 글씨만 찾는다.
+                elif text_target is not None:
                     stop_robot()
-                    last_target = target
+                    last_target = text_target
                     lost_count = 0
                     search_right_allowed = False
                     state = "ALIGN"
@@ -1436,36 +1350,37 @@ def control_loop():
             2
         )
 
-        # 3번째 화살표 우회전 기준선 (ROI 내부 좌표 -> 전체 프레임 좌표)
-        third_turn_y = oy + int(roi.shape[0] * THIRD_ARROW_TURN_RATIO)
-        cv2.line(
-            vis,
-            (ox, third_turn_y),
-            (w-ox, third_turn_y),
-            (0, 0, 255),
-            2
-        )
-        cv2.putText(
-            vis,
-            f"3RD TURN LINE {THIRD_ARROW_TURN_RATIO:.2f}",
-            (ox + 8, max(20, third_turn_y - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            .48,
-            (0, 0, 255),
-            2
-        )
-
-        # 3번째 화살표 접근 중에는 bbox 하단 위치도 표시
-        if state == "THIRD_ARROW_APPROACH" and arrow_target is not None:
-            ax, ay, aw, ah = arrow_target["bbox"]
-            arrow_bottom_frame = oy + ay + ah
-            cv2.circle(
+        # 카운트 2 이후 거리 기반 직진 기준선
+        # 앞 화살표 bbox 하단이 이 선까지 내려오면 우회전을 시작한다.
+        if state == "SECOND_COUNT_DISTANCE_DRIVE":
+            second_trigger_y = oy + int(roi.shape[0] * SECOND_COUNT_FORWARD_TRIGGER_RATIO)
+            cv2.line(
                 vis,
-                (ax + aw // 2 + ox, arrow_bottom_frame),
-                7,
-                (0, 255, 255),
-                -1
+                (ox, second_trigger_y),
+                (w-ox, second_trigger_y),
+                (0, 0, 255),
+                2
             )
+            cv2.putText(
+                vis,
+                f"COUNT2 DIST LINE {SECOND_COUNT_FORWARD_TRIGGER_RATIO:.2f}",
+                (ox + 8, max(20, second_trigger_y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                .48,
+                (0, 0, 255),
+                2
+            )
+
+            if arrow_target is not None:
+                ax, ay, aw, ah = arrow_target["bbox"]
+                arrow_bottom_frame = oy + ay + ah
+                cv2.circle(
+                    vis,
+                    (ax + aw // 2 + ox, arrow_bottom_frame),
+                    7,
+                    (0, 255, 255),
+                    -1
+                )
 
         # screen center
         cv2.line(
@@ -1574,7 +1489,7 @@ button{font-size:24px;margin:5px;padding:10px 20px}
 </style>
 </head>
 <body>
-<h2>Pinky Solid BLOB + STOP/STATION(YOLO)</h2>
+<h2>Pinky IR-COUNT BLOB + STOP/STATION(YOLO)</h2>
 <img src="/video_feed">
 <div>
 <button onclick="cmd('w')">W</button>
@@ -1640,7 +1555,8 @@ def command(key):
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
-    global search_right_allowed, third_arrow_trigger_count, second_ir_arrow_bottom
+    global search_right_allowed
+    global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     if key == "p":
         auto_mode = not auto_mode
@@ -1662,8 +1578,9 @@ def command(key):
         blob_missing_frames = 0
         ir_blob_count = 0
         search_right_allowed = False
-        third_arrow_trigger_count = 0
+        second_forward_trigger_count = 0
         second_ir_arrow_bottom = None
+        second_reference_acquired = False
         ir_armed = True
         ir_clear_count = 0
         stop_robot()
