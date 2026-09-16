@@ -99,6 +99,7 @@ MAX_CORR = 10
 
 # Search behavior
 IR_STOP_SEC = 0.45
+IR_COUNT_STOP_SEC = 0.18      # IR이 화살표를 밟으면 카운트 후 잠깐 정차
 IR_AFTER_HIT_DRIVE_SEC = 1.0   # STOP/STATION 이후 기존 동작용
 IR_CLEAR_FRAMES = 4            # 검은 표식에서 벗어난 것이 연속 4프레임 확인되면 IR 재활성화
 LOST_TARGET_FRAMES = 5
@@ -180,6 +181,10 @@ ir_blob_count = 0
 
 # 오른쪽 회전 허용 플래그
 search_right_allowed = False
+
+# 화살표를 카메라로 따라가기 시작한 뒤, 화면에서 사라져도
+# 다음 IR hit를 해당 화살표 통과로 인정하기 위한 latch
+arrow_ir_expected = False
 
 # 카운트 2 이후 거리 기반 직진용 상태값
 second_forward_trigger_count = 0
@@ -903,7 +908,7 @@ def control_loop():
     global yolo_frame_count, last_yolo_text, yolo_miss_count
     global last_stable_yolo_text, yolo_partial_count, last_text_mask_targets
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
-    global search_right_allowed
+    global search_right_allowed, arrow_ir_expected
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     ir_stop_time = 0.0
@@ -1062,6 +1067,8 @@ def control_loop():
                     drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
                 else:
                     last_target = target
+                    if target.get("type") == "ARROW":
+                        arrow_ir_expected = True
                     state = "ALIGN"
 
             # ====================================================
@@ -1080,6 +1087,8 @@ def control_loop():
                 else:
                     lost_count = 0
                     last_target = target
+                    if target.get("type") == "ARROW":
+                        arrow_ir_expected = True
 
                     target_x = target["center"][0] + ox
                     error = target_x - (w/2)
@@ -1102,21 +1111,28 @@ def control_loop():
             # 화살표 카운트는 IR을 실제로 밟은 순간에만 증가한다.
             # ====================================================
             elif state == "FOLLOW":
-                # IR 카운팅은 현재 실제 주행 목표가 화살표일 때만 수행한다.
-                # STOP/STATION 글씨를 밟았을 때 blob_count가 증가하는 것을 방지한다.
-                following_arrow = (target is not None and target.get("type") == "ARROW")
+                # 화살표가 현재 프레임에서 보이면 IR 대기 latch를 켠다.
+                # 이후 화살표가 카메라 아래로 빠져 target=None이 되어도
+                # IR이 검은 표식을 밟는 순간 해당 화살표를 통과한 것으로 인정한다.
+                if target is not None and target.get("type") == "ARROW":
+                    arrow_ir_expected = True
 
-                if ir_armed and ir_hit and following_arrow:
+                if ir_armed and ir_hit and arrow_ir_expected:
+                    # IR hit 순간 즉시 정차 -> 그 다음 카운트 증가
+                    stop_robot()
                     search_right_allowed = False
 
-                    # ---- 핵심 변경 ----
-                    # 화면 인식 시점이 아니라 IR 센서가 화살표를 실제로 밟은 순간 카운트
                     blob_count += 1
                     ir_blob_count = blob_count
                     print(f"[IR ARROW COUNT] {blob_count}")
 
+                    # 같은 화살표를 중복 카운트하지 않도록 latch와 IR을 동시에 잠근다.
+                    arrow_ir_expected = False
                     ir_armed = False
                     ir_clear_count = 0
+
+                    # 실제로 정차가 눈에 보이도록 아주 짧게 유지한다.
+                    time.sleep(IR_COUNT_STOP_SEC)
 
                     # ------------------------------------------------
                     # 카운트 1:
@@ -1188,6 +1204,7 @@ def control_loop():
                         stop_robot()
                         last_target = arrow_target
                         lost_count = 0
+                        arrow_ir_expected = True
                         state = "ALIGN"
                         print("[COUNT 1] next arrow acquired")
 
@@ -1228,6 +1245,7 @@ def control_loop():
 
                         if second_forward_trigger_count >= SECOND_COUNT_TRIGGER_FRAMES:
                             stop_robot()
+                            arrow_ir_expected = False
                             search_right_allowed = True
                             second_forward_trigger_count = 0
                             state = "SEARCH_STOP_RIGHT"
@@ -1293,6 +1311,7 @@ def control_loop():
                     if abs(error) <= CENTER_TOL:
                         stop_robot()
                         search_right_allowed = False
+                        arrow_ir_expected = False
                         state = "FOLLOW"
                         print("[STOP] centered -> follow straight")
                     else:
@@ -1331,6 +1350,7 @@ def control_loop():
                     last_target = text_target
                     lost_count = 0
                     search_right_allowed = False
+                    arrow_ir_expected = False
                     state = "ALIGN"
 
                 else:
@@ -1555,7 +1575,7 @@ def command(key):
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
-    global search_right_allowed
+    global search_right_allowed, arrow_ir_expected
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     if key == "p":
@@ -1578,6 +1598,7 @@ def command(key):
         blob_missing_frames = 0
         ir_blob_count = 0
         search_right_allowed = False
+        arrow_ir_expected = False
         second_forward_trigger_count = 0
         second_ir_arrow_bottom = None
         second_reference_acquired = False
