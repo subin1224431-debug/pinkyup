@@ -72,9 +72,15 @@ MANUAL_PULSE = 0.30
 # IR threshold
 IR_THRESHOLD = 2600
 
-# Camera ROI: 아래 50%, 좌우 10% 제외
+# AUTO 시작 직후 1초 동안은 목표/IR을 무시하고 직진만 한다.
+START_STRAIGHT_ONLY_SEC = 1.0
+
+# Camera ROI: 아래 50%
+# 기존에는 좌우 각각 10%를 제외했지만,
+# 왼쪽 ROI를 10% 넓혀서 왼쪽은 0%, 오른쪽은 기존처럼 10% 제외한다.
 ROI_TOP_RATIO = 0.50
-ROI_SIDE_RATIO = 0.10
+ROI_LEFT_RATIO = 0.00
+ROI_RIGHT_RATIO = 0.10
 
 # HSV thresholds
 WHITE_LO = np.array([0, 0, 175], dtype=np.uint8)
@@ -86,7 +92,7 @@ BLACK_HI = np.array([180, 130, 115], dtype=np.uint8)
 # Detection
 MIN_BLACK_AREA = 350
 MIN_ARROW_AREA = 900
-PARTIAL_BLOB_MIN_AREA = 420   # 화면에 약 2/3 정도만 보여도 허용
+PARTIAL_BLOB_MIN_AREA = 300   # 화면에 약 1/3 정도만 보여도 허용
 BLOB_GROUP_GAP = 35           # 반사로 갈라진 조각을 같은 화살표로 묶는 최대 간격(px)
 BLOB_EDGE_MARGIN = 5          # 화면 경계에 닿으면 잘린 Blob으로 판단
 BLOB_GONE_FRAMES = 10         # 같은 화살표 재카운트 방지: 충분히 사라진 뒤 다음 카운트 허용
@@ -104,6 +110,10 @@ IR_AFTER_HIT_DRIVE_SEC = 1.0   # STOP/STATION 이후 기존 동작용
 IR_CLEAR_FRAMES = 4            # 검은 표식에서 벗어난 것이 연속 4프레임 확인되면 IR 재활성화
 LOST_TARGET_FRAMES = 5
 
+# 카운트 3 전용 동작
+COUNT3_REVERSE_SEC = 1.0       # 카운트 3이 되는 순간 1초 후진
+COUNT3_STOP_SEC = 3.0          # 후진 후 3초 정지
+
 # ------------------------------------------------------------
 # 카운트 2 이후 거리 기반 직진 설정
 # ------------------------------------------------------------
@@ -116,7 +126,7 @@ LOST_TARGET_FRAMES = 5
 # 값이 작을수록 화살표가 멀리 있을 때 일찍 우회전하고,
 # 값이 클수록 화살표에 더 가까이 간 뒤 늦게 우회전한다.
 # 예: 0.55 -> 일찍, 0.65 -> 중간, 0.75 -> 늦게
-SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.68
+SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.36
 
 # 카운트 2를 밟은 직후 화면 아래에 남아 있는 "방금 밟은 화살표"와
 # 앞쪽의 다음 화살표를 구분하기 위한 점프 기준. ROI 높이의 이 비율 이상
@@ -139,6 +149,7 @@ JPEG_QUALITY = 55
 # ----------------------------
 state = "START"
 auto_mode = False
+auto_start_time = 0.0
 stop_event = threading.Event()
 
 latest_jpeg = None
@@ -160,6 +171,11 @@ YOLO_EDGE_MARGIN = 18
 YOLO_STABLE_HOLD = 1
 yolo_partial_count = 0
 last_text_mask_targets = []
+
+# 우회전 탐색 중 글씨가 화면에 반쯤 들어온 상태에서
+# STOP/STATION을 성급하게 확정하지 않도록 하는 조건
+TEXT_FULL_MARGIN = 35          # 화면 좌우 가장자리에서 최소 이만큼 안쪽
+TEXT_FULL_STABLE_FRAMES = 3    # 전체 글씨가 연속 3프레임 보여야 확정
 
 # STOP / STATION bbox 흔들림 보정
 TEXT_BBOX_ALPHA = 0.60       # 현재 검출값을 더 많이 반영해 주행 중 bbox가 따라오게 함
@@ -185,6 +201,17 @@ search_right_allowed = False
 # 화살표를 카메라로 따라가기 시작한 뒤, 화면에서 사라져도
 # 다음 IR hit를 해당 화살표 통과로 인정하기 위한 latch
 arrow_ir_expected = False
+
+# IR -> 1초 직진 -> 우회전 탐색을 반복하는 후속 구간 상태
+repeat_ir_cycle = False
+
+# SEARCH_RIGHT에서 "먼저 발견한 목표"를 잠근다.
+# None / "ARROW" / "STOP" / "STATION"
+search_locked_target_type = None
+
+# 우회전 탐색 중 글씨 전체 노출 확인용
+search_text_full_count = 0
+search_text_candidate_type = None
 
 # 카운트 2 이후 거리 기반 직진용 상태값
 second_forward_trigger_count = 0
@@ -220,8 +247,8 @@ def get_roi(frame):
     h, w = frame.shape[:2]
 
     y1 = int(h * ROI_TOP_RATIO)
-    x1 = int(w * ROI_SIDE_RATIO)
-    x2 = int(w * (1.0 - ROI_SIDE_RATIO))
+    x1 = int(w * ROI_LEFT_RATIO)
+    x2 = int(w * (1.0 - ROI_RIGHT_RATIO))
 
     roi = frame[y1:h, x1:x2]
     return roi, x1, y1
@@ -900,7 +927,7 @@ def draw_target(vis, target, ox, oy):
 # ============================================================
 
 def control_loop():
-    global state, auto_mode, latest_jpeg
+    global state, auto_mode, auto_start_time, latest_jpeg
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count
     global lost_count, last_target
@@ -909,9 +936,12 @@ def control_loop():
     global last_stable_yolo_text, yolo_partial_count, last_text_mask_targets
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed, arrow_ir_expected
+    global repeat_ir_cycle, search_locked_target_type
+    global search_text_full_count, search_text_candidate_type
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     ir_stop_time = 0.0
+    count3_action_time = 0.0
 
     while not stop_event.is_set():
 
@@ -994,7 +1024,7 @@ def control_loop():
         # 목표 선택
         # ----------------------------------------------------
         stop_target = None
-        if text_target is not None and text_target.get("type") == "STOP":
+        if text_target is not None and text_target.get("type") in ("STOP", "STATION"):
             stop_target = text_target
 
         if state in ("FIRST_BLOB_STRAIGHT", "SECOND_COUNT_DISTANCE_DRIVE"):
@@ -1003,26 +1033,43 @@ def control_loop():
             target = arrow_target
 
         elif state in ("SEARCH_STOP_RIGHT", "ALIGN_STOP"):
-            # 우회전 후에는 STOP만 목표로 인정한다.
+            # 카운트 2 이후 전용 회전/정렬 단계에서는
+            # STOP / STATION 둘 다 bbox 목표로 인정한다.
             target = stop_target
 
         else:
-            # 평상시는 기존처럼 화면에서 더 가까운 목표를 사용한다.
-            visible_targets = []
+            # SEARCH_RIGHT에서 먼저 잡은 목표가 있으면 그 종류를 유지한다.
+            # 즉, 글씨를 먼저 잡았으면 글씨를, 화살표를 먼저 잡았으면 화살표를
+            # IR을 밟을 때까지 다른 종류로 바꾸지 않는다.
+            if search_locked_target_type == "ARROW":
+                target = arrow_target
 
-            if text_target is not None:
-                visible_targets.append(text_target)
+            elif search_locked_target_type in TEXT_CLASSES:
+                if (
+                    text_target is not None
+                    and text_target.get("type") == search_locked_target_type
+                ):
+                    target = text_target
+                else:
+                    target = None
 
-            if arrow_target is not None:
-                visible_targets.append(arrow_target)
-
-            if visible_targets:
-                target = max(
-                    visible_targets,
-                    key=lambda z: z["bbox"][1] + z["bbox"][3]
-                )
             else:
-                target = None
+                # 평상시는 화면에서 더 가까운 목표 사용
+                visible_targets = []
+
+                if text_target is not None:
+                    visible_targets.append(text_target)
+
+                if arrow_target is not None:
+                    visible_targets.append(arrow_target)
+
+                if visible_targets:
+                    target = max(
+                        visible_targets,
+                        key=lambda z: z["bbox"][1] + z["bbox"][3]
+                    )
+                else:
+                    target = None
 
         ir_l, ir_c, ir_r = ir.read_ir()
         ir_hit = (
@@ -1059,10 +1106,21 @@ def control_loop():
 
         else:
             # ====================================================
+            # AUTO 시작 직후 1초
+            # IR/화살표/글씨 판단을 전부 무시하고 직진만 한다.
+            # 따라서 이 1초 동안은 IR 카운트가 절대 증가하지 않는다.
+            # ====================================================
+            if time.time() - auto_start_time < START_STRAIGHT_ONLY_SEC:
+                state = "START"
+                arrow_ir_expected = False
+                search_locked_target_type = None
+                drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
+
+            # ====================================================
             # START
             # 검은 목표가 보일 때까지 직진
             # ====================================================
-            if state == "START":
+            elif state == "START":
                 if target is None:
                     drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
                 else:
@@ -1111,13 +1169,35 @@ def control_loop():
             # 화살표 카운트는 IR을 실제로 밟은 순간에만 증가한다.
             # ====================================================
             elif state == "FOLLOW":
+                # ------------------------------------------------
+                # 반복 후속 구간:
+                # SEARCH_RIGHT에서 먼저 발견한 글씨/화살표를 정렬해서 따라간 뒤
+                # IR을 밟으면 목표 종류와 상관없이 1초 직진 -> 정지 -> 다시 우회전 탐색
+                # ------------------------------------------------
+                if repeat_ir_cycle and ir_armed and ir_hit:
+                    # 화살표를 따라온 경우에는 카운트 표시만 증가시킨다.
+                    if search_locked_target_type == "ARROW":
+                        blob_count += 1
+                        ir_blob_count = blob_count
+                        print(f"[IR ARROW COUNT] {blob_count}")
+
+                    ir_armed = False
+                    ir_clear_count = 0
+                    arrow_ir_expected = False
+                    search_locked_target_type = None
+                    search_right_allowed = False
+
+                    ir_stop_time = time.time()
+                    state = "IR_CONTINUE"
+                    print("[REPEAT] IR hit -> 1.0s straight")
+
                 # 화살표가 현재 프레임에서 보이면 IR 대기 latch를 켠다.
                 # 이후 화살표가 카메라 아래로 빠져 target=None이 되어도
                 # IR이 검은 표식을 밟는 순간 해당 화살표를 통과한 것으로 인정한다.
                 if target is not None and target.get("type") == "ARROW":
                     arrow_ir_expected = True
 
-                if ir_armed and ir_hit and arrow_ir_expected:
+                if (not repeat_ir_cycle) and ir_armed and ir_hit and arrow_ir_expected:
                     # IR hit 순간 즉시 정차 -> 그 다음 카운트 증가
                     stop_robot()
                     search_right_allowed = False
@@ -1162,10 +1242,19 @@ def control_loop():
                         print("[COUNT 2] distance-based forward drive")
 
                     # ------------------------------------------------
-                    # 카운트 3 이상:
-                    # 기존 로직 유지: IR -> 1초 직진 -> 정지 -> 우회전 -> YOLO 탐색
+                    # 카운트 3:
+                    # 1초 후진 -> 3초 정지 -> 이후 기존 후속 로직으로 진행
                     # ------------------------------------------------
-                    elif ir_blob_count >= 3:
+                    elif ir_blob_count == 3:
+                        count3_action_time = time.time()
+                        state = "COUNT3_REVERSE"
+                        print("[COUNT 3] reverse 1.0s -> stop 3.0s")
+
+                    # ------------------------------------------------
+                    # 카운트 4 이상:
+                    # 기존 로직 그대로
+                    # ------------------------------------------------
+                    elif ir_blob_count >= 4:
                         ir_stop_time = time.time()
                         state = "IR_CONTINUE"
 
@@ -1271,9 +1360,9 @@ def control_loop():
                     drive(SECOND_COUNT_FORWARD_SPEED, SECOND_COUNT_FORWARD_SPEED)
 
             # ====================================================
-            # SEARCH STOP RIGHT
+            # SEARCH TEXT RIGHT
             # 3번째 화살표 기준선에서 오른쪽 제자리 회전.
-            # 이때는 남아 있는 화살표와 STATION을 모두 무시하고 STOP만 찾는다.
+            # STOP / STATION 둘 중 먼저 인식되는 글씨의 bbox를 목표로 사용한다.
             # ====================================================
             elif state == "SEARCH_STOP_RIGHT":
                 if not search_right_allowed:
@@ -1285,18 +1374,21 @@ def control_loop():
                     last_target = stop_target
                     lost_count = 0
                     state = "ALIGN_STOP"
-                    print("[STOP] detected during right turn -> align")
+                    print(
+                        f"[{stop_target.get('type')}] "
+                        f"detected during right turn -> align"
+                    )
                 else:
                     drive(SEARCH_SPEED, -SEARCH_SPEED)
 
             # ====================================================
-            # ALIGN STOP
-            # STOP bbox 중심이 화면 중앙에 올 때까지 제자리 회전으로 미세 정렬.
-            # 정렬 완료 뒤 STOP을 향해 직진 추종한다.
+            # ALIGN TEXT
+            # STOP / STATION bbox 중심이 화면 중앙에 올 때까지 제자리 회전으로 미세 정렬.
+            # 정렬 완료 뒤 해당 글씨를 향해 직진 추종한다.
             # ====================================================
             elif state == "ALIGN_STOP":
                 if stop_target is None:
-                    # STOP을 순간적으로 놓치면 다시 오른쪽 탐색으로 복귀
+                    # STOP/STATION을 순간적으로 놓치면 다시 오른쪽 탐색으로 복귀
                     lost_count += 1
                     if lost_count >= LOST_TARGET_FRAMES:
                         lost_count = 0
@@ -1313,12 +1405,52 @@ def control_loop():
                         search_right_allowed = False
                         arrow_ir_expected = False
                         state = "FOLLOW"
-                        print("[STOP] centered -> follow straight")
+                        print(
+                            f"[{stop_target.get('type')}] "
+                            f"centered -> follow straight"
+                        )
                     else:
                         if error > 0:
                             drive(ALIGN_SPEED, -ALIGN_SPEED)
                         else:
                             drive(-ALIGN_SPEED, ALIGN_SPEED)
+
+            # ====================================================
+            # COUNT 3 REVERSE
+            # 카운트 3이 된 직후 1초 후진
+            # ====================================================
+            elif state == "COUNT3_REVERSE":
+                if time.time() - count3_action_time < COUNT3_REVERSE_SEC:
+                    drive(-FOLLOW_SPEED, -FOLLOW_SPEED)
+                else:
+                    stop_robot()
+                    count3_action_time = time.time()
+                    state = "COUNT3_STOP"
+
+            # ====================================================
+            # COUNT 3 STOP
+            # 1초 후진 완료 후 3초 정지
+            # ====================================================
+            elif state == "COUNT3_STOP":
+                stop_robot()
+
+                if time.time() - count3_action_time >= COUNT3_STOP_SEC:
+                    # 카운트 3 이후부터:
+                    # IR -> 1초 직진 -> 우회전 탐색 ->
+                    # 먼저 보이는 글씨/화살표 추종 -> IR -> 1초 직진 ...
+                    # 이 반복 로직으로 전환한다.
+                    repeat_ir_cycle = True
+                    search_locked_target_type = None
+
+                    # 같은 IR 표식 위에 아직 있을 수 있으므로
+                    # 흰 바닥을 확인하기 전까지 IR 재감지는 막는다.
+                    ir_armed = False
+                    ir_clear_count = 0
+                    arrow_ir_expected = False
+
+                    ir_stop_time = time.time()
+                    state = "IR_CONTINUE"
+                    print("[COUNT 3] enter repeat target cycle")
 
             # ====================================================
             # 기존 IR 후속 상태
@@ -1337,6 +1469,9 @@ def control_loop():
 
                 if time.time() - ir_stop_time >= IR_STOP_SEC:
                     search_right_allowed = True
+                    search_locked_target_type = None
+                    search_text_full_count = 0
+                    search_text_candidate_type = None
                     state = "SEARCH_RIGHT"
 
             elif state == "SEARCH_RIGHT":
@@ -1344,17 +1479,91 @@ def control_loop():
                     drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
                     state = "FOLLOW"
 
-                # 카운트 3 이상 기존 후속 구간: 우회전하면서 YOLO 글씨만 찾는다.
-                elif text_target is not None:
-                    stop_robot()
-                    last_target = text_target
-                    lost_count = 0
-                    search_right_allowed = False
-                    arrow_ir_expected = False
-                    state = "ALIGN"
-
                 else:
-                    drive(SEARCH_SPEED, -SEARCH_SPEED)
+                    # ------------------------------------------------
+                    # 화살표:
+                    # 기존처럼 보이면 바로 목표 후보로 사용 가능.
+                    #
+                    # STOP / STATION:
+                    # 회전 중 글씨가 반쯤만 보일 때는 절대 바로 정렬하지 않는다.
+                    # bbox가 화면 좌우 가장자리에서 충분히 안쪽으로 들어오고,
+                    # clipped=False 상태가 연속 TEXT_FULL_STABLE_FRAMES 동안
+                    # 유지된 뒤에만 "글씨 전체가 보였다"고 판단한다.
+                    # ------------------------------------------------
+                    full_text_target = None
+
+                    if text_target is not None:
+                        fx1, fy1, fx2, fy2 = text_target.get(
+                            "frame_bbox",
+                            (0, 0, 0, 0)
+                        )
+
+                        text_fully_inside = (
+                            not text_target.get("clipped", False)
+                            and fx1 >= TEXT_FULL_MARGIN
+                            and fx2 <= (w - TEXT_FULL_MARGIN)
+                        )
+
+                        current_text_type = text_target.get("type")
+
+                        if text_fully_inside:
+                            if search_text_candidate_type == current_text_type:
+                                search_text_full_count += 1
+                            else:
+                                search_text_candidate_type = current_text_type
+                                search_text_full_count = 1
+
+                            if search_text_full_count >= TEXT_FULL_STABLE_FRAMES:
+                                full_text_target = text_target
+                        else:
+                            search_text_full_count = 0
+                            search_text_candidate_type = None
+                    else:
+                        search_text_full_count = 0
+                        search_text_candidate_type = None
+
+                    # 글씨는 "전체 노출 확인 완료"된 경우에만 후보가 된다.
+                    # 화살표는 기존처럼 바로 후보 가능.
+                    first_target = None
+
+                    if full_text_target is not None and arrow_target is None:
+                        first_target = full_text_target
+
+                    elif arrow_target is not None and full_text_target is None:
+                        first_target = arrow_target
+
+                    elif full_text_target is not None and arrow_target is not None:
+                        # 둘 다 유효한 상태라면 더 가까운 목표를 선택
+                        first_target = max(
+                            [full_text_target, arrow_target],
+                            key=lambda z: z["bbox"][1] + z["bbox"][3]
+                        )
+
+                    if first_target is not None:
+                        stop_robot()
+                        last_target = first_target
+                        lost_count = 0
+                        search_right_allowed = False
+
+                        search_locked_target_type = first_target.get("type")
+
+                        # 다음 탐색을 위해 글씨 확인 카운터 초기화
+                        search_text_full_count = 0
+                        search_text_candidate_type = None
+
+                        if search_locked_target_type == "ARROW":
+                            arrow_ir_expected = True
+                        else:
+                            arrow_ir_expected = False
+
+                        state = "ALIGN"
+                        print(
+                            f"[SEARCH] full target locked: "
+                            f"{search_locked_target_type}"
+                        )
+                    else:
+                        # 아직 글씨 전체가 안 들어왔으면 계속 오른쪽으로 돌면서 더 본다.
+                        drive(SEARCH_SPEED, -SEARCH_SPEED)
 
         # ========================================================
         # Draw
@@ -1571,17 +1780,22 @@ def video_feed():
 
 @app.route("/cmd/<key>")
 def command(key):
-    global auto_mode, state
+    global auto_mode, state, auto_start_time
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed, arrow_ir_expected
+    global repeat_ir_cycle, search_locked_target_type
+    global search_text_full_count, search_text_candidate_type
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     if key == "p":
         auto_mode = not auto_mode
 
         if auto_mode:
+            # AUTO를 켠 순간부터 첫 1초는 IR/목표를 무시하고 직진만 한다.
+            auto_start_time = time.time()
+
             # AUTO를 다시 켜도 Blob 카운트는 유지한다.
             # 일시정지/재시작 때문에 BLOB_COUNT가 0으로 돌아가지 않음.
             state = "START"
@@ -1592,6 +1806,7 @@ def command(key):
         # RESET을 눌렀을 때만 Blob 카운트를 0으로 초기화
         auto_mode = False
         state = "START"
+        auto_start_time = 0.0
         blob_count = 0
         blob_count_armed = True
         blob_ir_passed = False
@@ -1599,6 +1814,10 @@ def command(key):
         ir_blob_count = 0
         search_right_allowed = False
         arrow_ir_expected = False
+        repeat_ir_cycle = False
+        search_locked_target_type = None
+        search_text_full_count = 0
+        search_text_candidate_type = None
         second_forward_trigger_count = 0
         second_ir_arrow_bottom = None
         second_reference_acquired = False
