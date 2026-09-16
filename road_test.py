@@ -99,8 +99,7 @@ MAX_CORR = 10
 
 # Search behavior
 IR_STOP_SEC = 0.45
-IR_AFTER_HIT_DRIVE_SEC = 1.0   # 기본: IR 감지 후 1초 더 직진
-FINAL_TEXT_AFTER_HIT_DRIVE_SEC = 1.5  # Blob 4 이후 다음 글씨에서만 1.5초 직진
+IR_AFTER_HIT_DRIVE_SEC = 1.0   # 두 번째 Blob부터 IR 감지 후 1초 더 직진
 IR_CLEAR_FRAMES = 4   # 검은 표식에서 벗어난 것이 연속 4프레임 확인되면 IR 재활성화
 LOST_TARGET_FRAMES = 5
 
@@ -157,11 +156,6 @@ ir_blob_count = 0
 
 # 오른쪽 회전은 반드시 IR 감지 -> 1초 직진 -> 정지 과정을 거친 뒤에만 허용
 search_right_allowed = False
-
-# Blob 4 이후의 다음 글씨 전용 상태
-# 글씨 bbox를 따라가다가 글씨가 화면에서 사라진 뒤 IR을 기다린다.
-final_text_tracking = False
-final_text_disappeared = False
 
 # ============================================================
 # Motor helpers
@@ -881,10 +875,8 @@ def control_loop():
     global last_stable_yolo_text, yolo_partial_count, last_text_mask_targets
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed
-    global final_text_tracking, final_text_disappeared
 
     ir_stop_time = 0.0
-    ir_after_hit_drive_sec = IR_AFTER_HIT_DRIVE_SEC
 
     while not stop_event.is_set():
 
@@ -1047,19 +1039,6 @@ def control_loop():
             else:
                 target = None
 
-        # ----------------------------------------------------
-        # Blob 4 이후 다음 목표가 글씨(STOP/STATION)인 경우:
-        # 글씨 bbox가 보이는 동안에는 계속 그 글씨를 추종한다.
-        # 글씨가 화면에서 사라진 뒤에야 IR 감지 단계를 허용한다.
-        # ----------------------------------------------------
-        if blob_count >= 4:
-            if target is not None and target.get("type") in TEXT_CLASSES:
-                final_text_tracking = True
-                final_text_disappeared = False
-
-            elif final_text_tracking and text_target is None:
-                final_text_disappeared = True
-
         ir_l, ir_c, ir_r = ir.read_ir()
         ir_hit = (
             ir_l >= IR_THRESHOLD or
@@ -1142,78 +1121,35 @@ def control_loop():
             # 화살표는 가장 큰 Blob 무게중심 / STOP·STATION은 YOLO bbox 중심 추종
             # ====================================================
             elif state == "FOLLOW":
-                # ------------------------------------------------
-                # Blob 4 이후의 글씨 전용 처리
-                #
-                # 1) 글씨 bbox가 보이는 동안은 계속 글씨 중심을 따라감
-                # 2) 글씨가 화면에서 사라질 때까지 IR은 무시
-                # 3) 글씨가 사라진 뒤 IR 감지
-                # 4) 그때부터 1.5초 직진 -> 정지 -> 우회전 재탐색
-                # ------------------------------------------------
-                if (
-                    final_text_tracking
-                    and not final_text_disappeared
-                ):
-                    # 글씨가 아직 화면에 있으면 IR이 들어와도 무시하고
-                    # bbox 중심으로 계속 주행
-                    if target is not None and target.get("type") in TEXT_CLASSES:
-                        last_target = target
-                        target_x = target["center"][0] + ox
-                        error = target_x - (w / 2)
-
-                        p_drive(
-                            error,
-                            FOLLOW_SPEED,
-                            KP_FOLLOW,
-                            MAX_CORR
-                        )
-                    else:
-                        # 글씨가 방금 사라진 경우 직진 유지
-                        drive(FOLLOW_SPEED, FOLLOW_SPEED)
-
-                elif (
-                    final_text_tracking
-                    and final_text_disappeared
-                    and ir_armed
-                    and ir_hit
-                ):
-                    # 글씨가 완전히 사라진 뒤 IR을 밟았을 때만
-                    # 1.5초 직진 알고리즘 실행
-                    ir_after_hit_drive_sec = FINAL_TEXT_AFTER_HIT_DRIVE_SEC
-
-                    ir_armed = False
-                    ir_clear_count = 0
+                if ir_armed and ir_hit:
+                    # IR을 실제로 밟기 전에는 회전 허용 안 함
                     search_right_allowed = False
 
-                    print(
-                        f"[FINAL TEXT PASSED] IR -> "
-                        f"{ir_after_hit_drive_sec:.1f}s straight"
-                    )
-
-                    ir_stop_time = time.time()
-                    state = "IR_CONTINUE"
-
-                    # 이번 글씨 처리 완료
-                    final_text_tracking = False
-                    final_text_disappeared = False
-
-                elif ir_armed and ir_hit:
                     # ------------------------------------------------
-                    # 일반 Blob 처리
+                    # 중요:
+                    # Blob이 화면에 잡혀 카운트된 것만으로는 절대 회전하지 않는다.
+                    # 반드시 그 Blob을 따라간 뒤 IR 센서를 실제로 밟아야
+                    # 다음 단계로 넘어간다.
                     # ------------------------------------------------
-                    search_right_allowed = False
                     ir_blob_count = blob_count
                     blob_ir_passed = True
 
                     ir_armed = False
                     ir_clear_count = 0
 
+                    # ------------------------------------------------
+                    # 첫 번째 Blob:
+                    # IR을 밟아도 정지/회전하지 않고 그대로 직진.
+                    # 기존 Blob이 사라진 뒤 다음 Blob 카운트를 허용한다.
+                    # ------------------------------------------------
                     if ir_blob_count == 1:
                         state = "FIRST_BLOB_STRAIGHT"
 
+                    # ------------------------------------------------
+                    # 두 번째 Blob부터:
+                    # IR 감지 -> 1초 더 직진 -> 정지 -> 우회전 탐색
+                    # ------------------------------------------------
                     elif ir_blob_count >= 2:
-                        # 일반 Blob에서는 기존대로 1초
-                        ir_after_hit_drive_sec = IR_AFTER_HIT_DRIVE_SEC
                         ir_stop_time = time.time()
                         state = "IR_CONTINUE"
 
@@ -1233,8 +1169,6 @@ def control_loop():
                     )
 
                 else:
-                    # 글씨를 지난 뒤 IR을 아직 안 밟았다면
-                    # 계속 앞으로 가면서 IR을 기다림
                     drive(FOLLOW_SPEED, FOLLOW_SPEED)
 
             # ====================================================
@@ -1262,7 +1196,7 @@ def control_loop():
             # Blob 2부터: IR 감지 후 1초 더 직진
             # ====================================================
             elif state == "IR_CONTINUE":
-                if time.time() - ir_stop_time < ir_after_hit_drive_sec:
+                if time.time() - ir_stop_time < IR_AFTER_HIT_DRIVE_SEC:
                     drive(FOLLOW_SPEED, FOLLOW_SPEED)
                 else:
                     stop_robot()
@@ -1490,7 +1424,6 @@ def command(key):
     global ir_armed, ir_clear_count
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed
-    global final_text_tracking, final_text_disappeared
 
     if key == "p":
         auto_mode = not auto_mode
@@ -1512,8 +1445,6 @@ def command(key):
         blob_missing_frames = 0
         ir_blob_count = 0
         search_right_allowed = False
-        final_text_tracking = False
-        final_text_disappeared = False
         ir_armed = True
         ir_clear_count = 0
         stop_robot()
