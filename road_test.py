@@ -123,8 +123,8 @@ COUNT5_STOP_SEC = 3.0
 
 # 카운트 6 전용 동작
 # 6번째 IR 감지 후: 1초 우회전 -> 1초 후진
-COUNT6_TURN_SEC = 0.5
-COUNT6_REVERSE_SEC = 1.0
+COUNT6_TURN_SEC = 0.3
+COUNT6_REVERSE_SEC = 2.0
 
 # ------------------------------------------------------------
 # 카운트 2 이후 거리 기반 직진 설정
@@ -1232,7 +1232,9 @@ def control_loop():
             elif state == "ALIGN":
                 # ALIGN은 글씨(STOP/STATION) 전용.
                 # 화살표는 제자리 정렬하지 않고 바로 FOLLOW로 넘긴다.
-                if target is not None and target.get("type") == "ARROW" and not arrow_alignment_locked:
+                if target is not None and target.get("type") == "ARROW":
+                    # STOP/STATION 정렬 구간에서는 화살표 절대 정렬 기준으로 사용하지 않음
+                    # 화살표는 다음 IR 카운팅용으로만 유지
                     arrow_ir_expected = True
                     state = "FOLLOW"
 
@@ -1497,6 +1499,8 @@ def control_loop():
             # 정렬 완료 뒤 해당 글씨를 향해 직진 추종한다.
             # ====================================================
             elif state == "ALIGN_STOP":
+                # STOP/STATION 정렬 전용 상태. ARROW는 절대 정렬 대상으로 사용하지 않음.
+                # YOLO stop_target만 사용한다.
                 if stop_target is None:
                     # STOP/STATION을 순간적으로 놓치면 다시 오른쪽 탐색으로 복귀
                     lost_count += 1
