@@ -123,7 +123,7 @@ COUNT5_STOP_SEC = 3.0
 
 # 카운트 6 전용 동작
 # 6번째 IR 감지 후: 1초 우회전 -> 1초 후진
-COUNT6_TURN_SEC = 1.0
+COUNT6_TURN_SEC = 0.5
 COUNT6_REVERSE_SEC = 1.0
 
 # ------------------------------------------------------------
@@ -2056,4 +2056,3 @@ if __name__ == "__main__":
     finally:
         stop_event.set()
         stop_robot()
-    
