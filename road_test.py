@@ -110,10 +110,6 @@ IR_AFTER_HIT_DRIVE_SEC = 1.0   # STOP/STATION 이후 기존 동작용
 IR_CLEAR_FRAMES = 4            # 검은 표식에서 벗어난 것이 연속 4프레임 확인되면 IR 재활성화
 LOST_TARGET_FRAMES = 5
 
-# 정렬 완료 후 IR 탐색 설정
-IR_SEARCH_RIGHT_SPEED = 18
-IR_SEARCH_STOP_SEC = 1.0
-
 # 카운트 3 전용 동작
 COUNT3_REVERSE_SEC = 1.0       # 카운트 3이 되는 순간 1초 후진
 COUNT3_STOP_SEC = 3.0          # 후진 후 3초 정지
@@ -1011,14 +1007,12 @@ def control_loop():
     global count5_special_pending
     global count6_action_time
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
-    global ir_search_time
 
     ir_stop_time = 0.0
     count3_action_time = 0.0
     count5_action_time = 0.0
     count6_action_time = 0.0
     count6_phase_time = 0.0
-    ir_search_time = 0.0
 
     while not stop_event.is_set():
 
@@ -1543,33 +1537,16 @@ def control_loop():
                         stop_robot()
                         search_right_allowed = False
                         arrow_ir_expected = False
-                        ir_search_time = time.time()
-                        state = "SEARCH_IR_RIGHT"
+                        state = "FOLLOW"
                         print(
                             f"[{stop_target.get('type')}] "
-                            f"centered -> search IR right"
+                            f"centered -> follow straight"
                         )
                     else:
                         if error > 0:
                             drive(ALIGN_SPEED, -ALIGN_SPEED)
                         else:
                             drive(-ALIGN_SPEED, ALIGN_SPEED)
-
-            # ====================================================
-            # SEARCH IR RIGHT
-            # 정렬 완료 후 바로 직진하지 않고 IR 센서가 다음 표식을
-            # 확인할 때까지 오른쪽으로 크게 회전 탐색
-            # ====================================================
-            elif state == "SEARCH_IR_RIGHT":
-                if ir_hit:
-                    stop_robot()
-                    time.sleep(IR_SEARCH_STOP_SEC)
-                    arrow_ir_expected = False
-                    ir_search_time = 0.0
-                    state = "FOLLOW"
-                    print("[SEARCH IR] detected -> follow")
-                else:
-                    drive(IR_SEARCH_RIGHT_SPEED, -IR_SEARCH_RIGHT_SPEED)
 
             # ====================================================
             # COUNT 3 REVERSE
@@ -1673,9 +1650,8 @@ def control_loop():
                     ir_clear_count = 0
                     search_right_allowed = True
                     search_locked_target_type = None
-                    ir_search_time = time.time()
-                    state = "SEARCH_IR_RIGHT"
-                    print("[COUNT 6] final stop done -> search IR")
+                    state = "FOLLOW"
+                    print("[COUNT 6] final stop done -> next count point")
 
             # ====================================================
             # COUNT 5 SPECIAL
