@@ -212,6 +212,9 @@ arrow_ir_expected = False
 # IR -> 1초 직진 -> 우회전 탐색을 반복하는 후속 구간 상태
 repeat_ir_cycle = False
 
+# IR 카운트 직후 다음 IR 카운트 전까지 화살표 정렬 금지
+arrow_alignment_locked = False
+
 # SEARCH_RIGHT에서 "먼저 발견한 목표"를 잠근다.
 # None / "ARROW" / "STOP" / "STATION"
 search_locked_target_type = None
@@ -991,7 +994,7 @@ def control_loop():
     global last_stable_yolo_text, yolo_partial_count, last_text_mask_targets
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed, arrow_ir_expected
-    global repeat_ir_cycle, search_locked_target_type
+    global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
     global search_text_full_count, search_text_candidate_type
     global count5_special_pending
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
@@ -1275,9 +1278,9 @@ def control_loop():
                         f"target={search_locked_target_type}"
                     )
 
-                    if blob_count == 5:
+                    if blob_count == 6:
                         count5_special_pending = True
-                        print("[COUNT 5] special maneuver reserved")
+                        print("[COUNT 6] station maneuver reserved")
 
                     ir_armed = False
                     ir_clear_count = 0
@@ -1561,7 +1564,7 @@ def control_loop():
                 else:
                     stop_robot()
 
-                    if count5_special_pending:
+                    if count5_special_pending and blob_count >= 6:
                         # STOP/STATION을 향해 맞춘 방향을 그대로 유지한다.
                         # 여기서 화살표 방향으로 재정렬하거나 회전하지 않고
                         # 바로 같은 축으로 1초 후진한다.
@@ -1928,7 +1931,7 @@ def command(key):
     global ir_armed, ir_clear_count
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed, arrow_ir_expected
-    global repeat_ir_cycle, search_locked_target_type
+    global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
     global search_text_full_count, search_text_candidate_type
     global count5_special_pending
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
@@ -1966,6 +1969,7 @@ def command(key):
         second_forward_trigger_count = 0
         second_ir_arrow_bottom = None
         second_reference_acquired = False
+        arrow_alignment_locked = False
         ir_armed = True
         ir_clear_count = 0
         stop_robot()
