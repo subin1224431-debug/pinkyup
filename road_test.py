@@ -1012,7 +1012,7 @@ def control_loop():
     count3_action_time = 0.0
     count5_action_time = 0.0
     count6_action_time = 0.0
-count6_phase_time = 0.0
+    count6_phase_time = 0.0
 
     while not stop_event.is_set():
 
@@ -1394,7 +1394,22 @@ count6_phase_time = 0.0
             # 카운트는 여기서 증가하지 않으며, 다음 화살표를 IR로 밟을 때 2가 된다.
             # ====================================================
             elif state == "FIRST_BLOB_STRAIGHT":
-                drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
+                # 다음 카운팅 화살표가 카메라 중앙선에 들어올 때까지 방향만 보정
+                # 화살표는 정렬용이 아니라 다음 IR 위치 확보용으로만 사용한다.
+                # 중심이 맞은 뒤 직진하여 IR을 밟도록 한다.
+                if arrow_target is not None:
+                    arrow_x = arrow_target["center"][0] + ox
+                    error = arrow_x - (w / 2)
+
+                    if abs(error) > CENTER_TOL:
+                        if error > 0:
+                            drive(ALIGN_SPEED, -ALIGN_SPEED)
+                        else:
+                            drive(-ALIGN_SPEED, ALIGN_SPEED)
+                    else:
+                        drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
+                else:
+                    drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
 
                 # IR이 다시 흰 바닥에서 재활성화된 뒤 보이는 화살표를
                 # 다음 화살표로 보고 ALIGN/FOLLOW로 복귀한다.
