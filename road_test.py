@@ -123,8 +123,11 @@ COUNT5_STOP_SEC = 3.0
 
 # 카운트 6 전용 동작
 # 6번째 IR 감지 후: 1초 우회전 -> 1초 후진
+COUNT6_PRE_STOP_SEC = 1.0
 COUNT6_TURN_SEC = 0.3
+COUNT6_POST_TURN_STOP_SEC = 1.0
 COUNT6_REVERSE_SEC = 2.0
+COUNT6_FINAL_STOP_SEC = 3.0
 
 # ------------------------------------------------------------
 # 카운트 2 이후 거리 기반 직진 설정
@@ -1009,6 +1012,7 @@ def control_loop():
     count3_action_time = 0.0
     count5_action_time = 0.0
     count6_action_time = 0.0
+count6_phase_time = 0.0
 
     while not stop_event.is_set():
 
@@ -1369,7 +1373,7 @@ def control_loop():
                         ir_stop_time = time.time()
                         state = "IR_CONTINUE"
 
-                elif target is not None and not arrow_alignment_locked:
+                elif target is not None and target.get("type") in ("STOP", "STATION"):
                     last_target = target
                     target_x = target["center"][0] + ox
                     error = target_x - (w/2)
@@ -1578,42 +1582,61 @@ def control_loop():
 
                     if count5_special_pending and blob_count >= 6:
                         # COUNT 6 전용: 우회전 1초 후 후진 1초
-                        count6_action_time = time.time()
-                        state = "COUNT6_TURN"
-                        print("[COUNT 6] 1s right turn -> 1s reverse")
+                        count6_phase_time = time.time()
+                        state = "COUNT6_PRE_STOP"
+                        print("[COUNT 6] pre stop 1s -> turn")
                     else:
                         ir_stop_time = time.time()
                         state = "IR_STOP"
 
             # ====================================================
-            # COUNT 6 SPECIAL TURN
-            # 6번째 IR 카운팅에서만 실행: 1초 우회전
+            # COUNT 6 SPECIAL
+            # 6번째 IR에서만 실행:
+            # 정지 1초 -> 우회전 0.3초 -> 정지 1초 -> 후진 2초 -> 정지 3초
             # ====================================================
+            elif state == "COUNT6_PRE_STOP":
+                stop_robot()
+                if time.time() - count6_phase_time >= COUNT6_PRE_STOP_SEC:
+                    count6_phase_time = time.time()
+                    state = "COUNT6_TURN"
+                    print("[COUNT 6] pre stop done -> turn 0.3s")
+
             elif state == "COUNT6_TURN":
-                if time.time() - count6_action_time < COUNT6_TURN_SEC:
+                if time.time() - count6_phase_time < COUNT6_TURN_SEC:
                     drive(FOLLOW_SPEED, -FOLLOW_SPEED)
                 else:
-                    count6_action_time = time.time()
-                    state = "COUNT6_REVERSE"
-                    print("[COUNT 6] turn done -> reverse 1s")
+                    stop_robot()
+                    count6_phase_time = time.time()
+                    state = "COUNT6_POST_TURN_STOP"
+                    print("[COUNT 6] turn done -> stop 1s")
 
-            # ====================================================
-            # COUNT 6 SPECIAL REVERSE
-            # 6번째 IR 카운팅에서만 실행: 우회전 후 1초 후진
-            # ====================================================
+            elif state == "COUNT6_POST_TURN_STOP":
+                stop_robot()
+                if time.time() - count6_phase_time >= COUNT6_POST_TURN_STOP_SEC:
+                    count6_phase_time = time.time()
+                    state = "COUNT6_REVERSE"
+                    print("[COUNT 6] stop done -> reverse 2s")
+
             elif state == "COUNT6_REVERSE":
-                if time.time() - count6_action_time < COUNT6_REVERSE_SEC:
+                if time.time() - count6_phase_time < COUNT6_REVERSE_SEC:
                     drive(-FOLLOW_SPEED, -FOLLOW_SPEED)
                 else:
                     stop_robot()
+                    count6_phase_time = time.time()
+                    state = "COUNT6_FINAL_STOP"
+                    print("[COUNT 6] reverse done -> stop 3s")
+
+            elif state == "COUNT6_FINAL_STOP":
+                stop_robot()
+                if time.time() - count6_phase_time >= COUNT6_FINAL_STOP_SEC:
                     count5_special_pending = False
-                    arrow_alignment_locked = False
+                    arrow_alignment_locked = True
                     ir_armed = False
                     ir_clear_count = 0
                     search_right_allowed = True
                     search_locked_target_type = None
-                    state = "SEARCH_RIGHT"
-                    print("[COUNT 6] reverse done -> search next target")
+                    state = "FOLLOW"
+                    print("[COUNT 6] final stop done -> next count point")
 
             # ====================================================
             # COUNT 5 SPECIAL
