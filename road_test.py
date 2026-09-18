@@ -72,6 +72,9 @@ MANUAL_PULSE = 0.30
 # IR threshold
 IR_THRESHOLD = 2600
 
+# IR 카운트가 한 번 증가하면 1.5초 동안 추가 카운트 금지
+IR_COUNT_COOLDOWN_SEC = 1.5
+
 # AUTO 시작 직후 1초 동안은 목표/IR을 무시하고 직진만 한다.
 START_STRAIGHT_ONLY_SEC = 1.0
 
@@ -178,6 +181,9 @@ last_target = None
 ir_armed = True
 ir_clear_count = 0
 
+# 마지막 IR 카운트 시각
+last_ir_count_time = -999.0
+
 yolo_frame_count = 0
 last_yolo_text = None
 yolo_miss_count = 0
@@ -233,6 +239,10 @@ search_text_candidate_type = None
 
 # 카운트 5 특수 동작 예약 플래그
 count5_special_pending = False
+
+# 카운트 4 이후 다음 화살표 전체 노출 확인용
+count4_arrow_full_frames = 0
+COUNT4_ARROW_FULL_STABLE_FRAMES = 3
 
 # 카운트 2 이후 거리 기반 직진용 상태값
 second_forward_trigger_count = 0
@@ -995,9 +1005,9 @@ def draw_target(vis, target, ox, oy):
 def control_loop():
     global state, auto_mode, auto_start_time, latest_jpeg
     global manual_until, manual_cmd
-    global ir_armed, ir_clear_count
+    global ir_armed, ir_clear_count, last_ir_count_time
     global lost_count, last_target
-    global ir_armed, ir_clear_count
+    global ir_armed, ir_clear_count, last_ir_count_time
     global yolo_frame_count, last_yolo_text, yolo_miss_count
     global last_stable_yolo_text, yolo_partial_count, last_text_mask_targets
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
@@ -1006,6 +1016,7 @@ def control_loop():
     global search_text_full_count, search_text_candidate_type
     global count5_special_pending
     global count6_action_time
+    global count4_arrow_full_frames
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     ir_stop_time = 0.0
@@ -1187,6 +1198,44 @@ def control_loop():
                 ir_armed = True
                 ir_clear_count = 0
 
+        # ----------------------------------------------------
+        # GLOBAL IR COUNT
+        #
+        # AUTO 시작 후 첫 1초만 제외하고,
+        # 이후에는 어떤 state에 있든 IR이 새 검은 표식을 밟으면
+        # 무조건 딱 1회 카운트한다.
+        #
+        # 같은 표식 중복 카운트는 ir_armed=False로 잠그고,
+        # 흰 바닥을 IR_CLEAR_FRAMES 연속 확인한 뒤에만 재활성화한다.
+        # ----------------------------------------------------
+        global_ir_count_event = False
+        now = time.time()
+
+        if (
+            auto_mode
+            and (now - auto_start_time) >= START_STRAIGHT_ONLY_SEC
+            and ir_armed
+            and ir_hit
+            and (now - last_ir_count_time) >= IR_COUNT_COOLDOWN_SEC
+        ):
+            blob_count += 1
+            ir_blob_count = blob_count
+            global_ir_count_event = True
+
+            # 카운트가 올라간 순간만 시간 저장.
+            # 이후 1.5초 동안 센서가 계속 감지돼도 카운트는 증가하지 않는다.
+            last_ir_count_time = now
+
+            print(
+                f"[GLOBAL IR COUNT] {blob_count} "
+                f"state={state} target={search_locked_target_type}"
+            )
+
+            # 같은 검은 표식 중복 카운트 방지
+            ir_armed = False
+            ir_clear_count = 0
+            arrow_ir_expected = False
+
         # --------------------------------
         # Manual override
         # --------------------------------
@@ -1199,11 +1248,76 @@ def control_loop():
 
         else:
             # ====================================================
+            # GLOBAL IR EVENT ROUTING
+            #
+            # 카운트 자체는 위에서 모든 state 공통으로 이미 처리됨.
+            # 여기서는 새 카운트가 발생했을 때 필요한 특수 동작만 분기한다.
+            # ====================================================
+            if global_ir_count_event:
+                # 카운트 1
+                if ir_blob_count == 1:
+                    search_right_allowed = False
+                    state = "FIRST_BLOB_STRAIGHT"
+                    print("[COUNT 1] global IR -> FIRST_BLOB_STRAIGHT")
+
+                # 카운트 2
+                elif ir_blob_count == 2:
+                    second_forward_trigger_count = 0
+                    second_reference_acquired = False
+
+                    if arrow_target is not None:
+                        ax, ay, aw, ah = arrow_target["bbox"]
+                        second_ir_arrow_bottom = ay + ah
+                    else:
+                        second_ir_arrow_bottom = None
+
+                    search_right_allowed = False
+                    state = "SECOND_COUNT_DISTANCE_DRIVE"
+                    print("[COUNT 2] global IR -> distance-based forward drive")
+
+                # 카운트 3
+                elif ir_blob_count == 3:
+                    search_locked_target_type = None
+                    search_right_allowed = False
+                    arrow_ir_expected = False
+                    count3_action_time = time.time()
+                    state = "COUNT3_REVERSE"
+                    print("[COUNT 3] global IR -> immediate reverse 1.0s")
+
+                # 카운트 4
+                elif ir_blob_count == 4:
+                    count4_arrow_full_frames = 0
+                    search_locked_target_type = None
+                    search_right_allowed = True
+                    state = "COUNT4_SEARCH_ARROW_RIGHT"
+                    print("[COUNT 4] global IR -> search full arrow to the right")
+
+                # 카운트 6 특수동작 예약
+                elif ir_blob_count == 6:
+                    count5_special_pending = True
+                    arrow_alignment_locked = True
+                    search_locked_target_type = None
+                    search_right_allowed = False
+
+                    ir_stop_time = time.time()
+                    state = "IR_CONTINUE"
+                    print("[COUNT 6] global IR -> station maneuver reserved")
+
+                # 그 외 카운트는 기존 반복 로직처럼
+                # 1초 직진 후 다음 목표 탐색으로 이어간다.
+                else:
+                    search_locked_target_type = None
+                    search_right_allowed = False
+                    ir_stop_time = time.time()
+                    state = "IR_CONTINUE"
+                    print(f"[COUNT {ir_blob_count}] global IR -> 1.0s straight")
+
+            # ====================================================
             # AUTO 시작 직후 1초
             # IR/화살표/글씨 판단을 전부 무시하고 직진만 한다.
             # 따라서 이 1초 동안은 IR 카운트가 절대 증가하지 않는다.
             # ====================================================
-            if time.time() - auto_start_time < START_STRAIGHT_ONLY_SEC:
+            elif time.time() - auto_start_time < START_STRAIGHT_ONLY_SEC:
                 state = "START"
                 arrow_ir_expected = False
                 search_locked_target_type = None
@@ -1280,31 +1394,7 @@ def control_loop():
                 # SEARCH_RIGHT에서 먼저 발견한 글씨/화살표를 정렬해서 따라간 뒤
                 # IR을 밟으면 목표 종류와 상관없이 1초 직진 -> 정지 -> 다시 우회전 탐색
                 # ------------------------------------------------
-                if repeat_ir_cycle and ir_armed and ir_hit:
-                    # 반복 구간에서는 목표 종류와 관계없이
-                    # 실제 IR 표식을 밟은 횟수를 카운트한다.
-                    # 따라서 ARROW / STOP / STATION 모두 동일하게 1회 증가한다.
-                    blob_count += 1
-                    ir_blob_count = blob_count
-                    print(
-                        f"[IR COUNT] {blob_count} "
-                        f"target={search_locked_target_type}"
-                    )
-
-                    if blob_count == 6:
-                        count5_special_pending = True
-                        arrow_alignment_locked = True
-                        print("[COUNT 6] station maneuver reserved")
-
-                    ir_armed = False
-                    ir_clear_count = 0
-                    arrow_ir_expected = False
-                    search_locked_target_type = None
-                    search_right_allowed = False
-
-                    ir_stop_time = time.time()
-                    state = "IR_CONTINUE"
-                    print("[REPEAT] IR hit -> 1.0s straight")
+                # IR 카운팅은 이제 state와 무관하게 위의 GLOBAL IR COUNT에서 처리한다.
 
                 # 화살표가 현재 프레임에서 보이면 IR 대기 latch를 켠다.
                 # 이후 화살표가 카메라 아래로 빠져 target=None이 되어도
@@ -1312,68 +1402,7 @@ def control_loop():
                 if target is not None and target.get("type") == "ARROW" and not arrow_alignment_locked:
                     arrow_ir_expected = True
 
-                if (not repeat_ir_cycle) and ir_armed and ir_hit and arrow_ir_expected:
-                    # IR hit 순간 즉시 정차 -> 그 다음 카운트 증가
-                    stop_robot()
-                    search_right_allowed = False
-
-                    blob_count += 1
-                    ir_blob_count = blob_count
-                    print(f"[IR ARROW COUNT] {blob_count}")
-
-                    # 같은 화살표를 중복 카운트하지 않도록 latch와 IR을 동시에 잠근다.
-                    arrow_ir_expected = False
-                    ir_armed = False
-                    ir_clear_count = 0
-
-                    # 실제로 정차가 눈에 보이도록 아주 짧게 유지한다.
-                    time.sleep(IR_COUNT_STOP_SEC)
-
-                    # ------------------------------------------------
-                    # 카운트 1:
-                    # 회전하지 않고 그대로 직진하며 다음 화살표를 찾는다.
-                    # ------------------------------------------------
-                    if ir_blob_count == 1:
-                        state = "FIRST_BLOB_STRAIGHT"
-
-                    # ------------------------------------------------
-                    # 카운트 2:
-                    # 기존의 '1초 직진 후 우회전'을 사용하지 않는다.
-                    # 앞쪽에 보이는 다음 화살표와의 영상상 거리를 기준으로 직진한다.
-                    # ------------------------------------------------
-                    elif ir_blob_count == 2:
-                        second_forward_trigger_count = 0
-                        second_reference_acquired = False
-
-                        # 방금 밟은 2번 화살표 bbox 하단을 저장해서
-                        # 이후 앞쪽의 새 화살표로 target이 바뀌는 시점을 구분한다.
-                        if arrow_target is not None:
-                            ax, ay, aw, ah = arrow_target["bbox"]
-                            second_ir_arrow_bottom = ay + ah
-                        else:
-                            second_ir_arrow_bottom = None
-
-                        state = "SECOND_COUNT_DISTANCE_DRIVE"
-                        print("[COUNT 2] distance-based forward drive")
-
-                    # ------------------------------------------------
-                    # 카운트 3:
-                    # 1초 후진 -> 3초 정지 -> 이후 기존 후속 로직으로 진행
-                    # ------------------------------------------------
-                    elif ir_blob_count == 3:
-                        count3_action_time = time.time()
-                        state = "COUNT3_REVERSE"
-                        print("[COUNT 3] reverse 1.0s -> stop 3.0s")
-
-                    # ------------------------------------------------
-                    # 카운트 4 이상:
-                    # 기존 로직 그대로
-                    # ------------------------------------------------
-                    elif ir_blob_count >= 4:
-                        ir_stop_time = time.time()
-                        state = "IR_CONTINUE"
-
-                elif target is not None and target.get("type") in ("STOP", "STATION"):
+                if target is not None and target.get("type") in ("STOP", "STATION"):
                     last_target = target
                     target_x = target["center"][0] + ox
                     error = target_x - (w/2)
@@ -1568,15 +1597,12 @@ def control_loop():
                 stop_robot()
 
                 if time.time() - count3_action_time >= COUNT3_STOP_SEC:
-                    # 카운트 3 이후부터:
-                    # IR -> 1초 직진 -> 우회전 탐색 ->
-                    # 먼저 보이는 글씨/화살표 추종 -> IR -> 1초 직진 ...
-                    # 이 반복 로직으로 전환한다.
+                    # 카운트 3은 기존 흐름 그대로 복귀:
+                    # 3초 정지 후 반복 주행 로직으로 진입한다.
                     repeat_ir_cycle = True
                     search_locked_target_type = None
 
-                    # 같은 IR 표식 위에 아직 있을 수 있으므로
-                    # 흰 바닥을 확인하기 전까지 IR 재감지는 막는다.
+                    # 같은 IR 표식 재감지 방지
                     ir_armed = False
                     ir_clear_count = 0
                     arrow_ir_expected = False
@@ -1584,6 +1610,71 @@ def control_loop():
                     ir_stop_time = time.time()
                     state = "IR_CONTINUE"
                     print("[COUNT 3] enter repeat target cycle")
+
+            # ====================================================
+            # COUNT 4 -> NEXT ARROW SEARCH
+            # 3초 정지 후 오른쪽으로 돌면서
+            # 화살표 전체 형태가 보일 때까지 기다린다.
+            # ====================================================
+            elif state == "COUNT4_SEARCH_ARROW_RIGHT":
+                full_arrow_visible = (
+                    arrow_target is not None
+                    and not arrow_target.get("partial", False)
+                )
+
+                if full_arrow_visible:
+                    count4_arrow_full_frames += 1
+                else:
+                    count4_arrow_full_frames = 0
+
+                if count4_arrow_full_frames >= COUNT4_ARROW_FULL_STABLE_FRAMES:
+                    stop_robot()
+                    last_target = arrow_target
+                    lost_count = 0
+                    count4_arrow_full_frames = 0
+                    state = "COUNT4_ALIGN_ARROW"
+                    print("[COUNT 4] full arrow visible -> align center")
+                else:
+                    drive(SEARCH_SPEED, -SEARCH_SPEED)
+
+            # ====================================================
+            # COUNT 4 -> NEXT ARROW ALIGN
+            # 화살표 전체가 확인된 뒤에만 중앙 정렬한다.
+            # 중앙 정렬 완료 후 직진한다.
+            # ====================================================
+            elif state == "COUNT4_ALIGN_ARROW":
+                if arrow_target is None:
+                    count4_arrow_full_frames = 0
+                    state = "COUNT4_SEARCH_ARROW_RIGHT"
+
+                elif arrow_target.get("partial", False):
+                    count4_arrow_full_frames = 0
+                    state = "COUNT4_SEARCH_ARROW_RIGHT"
+
+                else:
+                    target_x = arrow_target["center"][0] + ox
+                    error = target_x - (w / 2)
+
+                    if abs(error) <= CENTER_TOL:
+                        stop_robot()
+                        last_target = arrow_target
+
+                        # 카운트4 이후 다음 화살표를 정확히 추종 대상으로 고정.
+                        # 화살표 중앙 정렬 완료 후 FOLLOW로 들어가고,
+                        # IR이 아직 잠겨 있다면 흰 바닥을 벗어난 뒤 자동 재활성화된다.
+                        arrow_ir_expected = True
+                        search_locked_target_type = "ARROW"
+                        search_right_allowed = False
+                        state = "FOLLOW"
+                        print(
+                            "[COUNT 4] arrow centered -> FOLLOW / "
+                            f"IR_ARMED={ir_armed}"
+                        )
+                    else:
+                        if error > 0:
+                            drive(ALIGN_SPEED, -ALIGN_SPEED)
+                        else:
+                            drive(-ALIGN_SPEED, ALIGN_SPEED)
 
             # ====================================================
             # 기존 IR 후속 상태
@@ -2013,6 +2104,7 @@ def command(key):
     global search_text_full_count, search_text_candidate_type
     global count5_special_pending
     global count6_action_time
+    global count4_arrow_full_frames
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     if key == "p":
@@ -2045,12 +2137,14 @@ def command(key):
         search_text_full_count = 0
         search_text_candidate_type = None
         count5_special_pending = False
+        count4_arrow_full_frames = 0
         second_forward_trigger_count = 0
         second_ir_arrow_bottom = None
         second_reference_acquired = False
         arrow_alignment_locked = False
         ir_armed = True
         ir_clear_count = 0
+        last_ir_count_time = -999.0
         stop_robot()
 
     elif key == "space":
