@@ -77,8 +77,9 @@ IR_THRESHOLD = 2600
 # IR 카운트가 한 번 증가하면 1.5초 동안 추가 카운트 금지
 IR_COUNT_COOLDOWN_SEC = 1.5
 
-# AUTO 시작 직후 1초 동안은 목표/IR을 무시하고 직진만 한다.
-START_STRAIGHT_ONLY_SEC = 1.0
+# AUTO 시작 직후 1초 동안은 카메라 목표 인식은 그대로 사용하고,
+# IR 센서가 감지되어도 "IR 카운팅만" 증가시키지 않는다.
+START_IR_COUNT_IGNORE_SEC = 1.0
 
 # Camera ROI: 아래 50%
 # 기존에는 좌우 각각 10%를 제외했지만,
@@ -119,20 +120,15 @@ LOST_TARGET_FRAMES = 5
 COUNT3_REVERSE_SEC = 1.0       # 카운트 3이 되는 순간 1초 후진
 COUNT3_STOP_SEC = 3.0          # 후진 후 3초 정지
 
-# 카운트 5 전용 동작
-# 기존처럼 IR 감지 후 1초 직진까지는 하고,
-# STOP/STATION을 향해 정렬한 방향을 그대로 유지한 채
-# 후진 1초 -> 3초 정지 후 다시 기존 다음 목표 탐색으로 복귀한다.
-COUNT5_REVERSE_SEC = 1.0
-COUNT5_STOP_SEC = 3.0
+# 카운트 5는 별도 특수동작 없음.
+# 다른 일반 카운트처럼:
+# IR 카운트 -> 1초 직진 -> 다음 노드 탐색 -> 정렬 -> 주행
 
 # 카운트 6 전용 동작
-# 6번째 IR 감지 후: 1초 우회전 -> 1초 후진
-
-COUNT6_PRE_STOP_SEC = 1.0
-COUNT6_TURN_SEC = 0.3
-COUNT6_POST_TURN_STOP_SEC = 1.0
-COUNT6_REVERSE_SEC = 2.0
+# 6번째 IR 카운트:
+# 즉시 정지 -> 오른쪽 제자리 회전 1초 -> 후진 1초 -> 정지 3초
+COUNT6_TURN_SEC = 1.0
+COUNT6_REVERSE_SEC = 1.0
 COUNT6_FINAL_STOP_SEC = 3.0
 
 # ------------------------------------------------------------
@@ -232,16 +228,14 @@ repeat_ir_cycle = False
 # IR 카운트 직후 다음 IR 카운트 전까지 화살표 정렬 금지
 arrow_alignment_locked = False
 
-# SEARCH_RIGHT에서 "먼저 발견한 목표"를 잠근다.
+# SEARCH_RIGHT에서 "먼저 발견한 다음 노드"를 잠근다.
+# 다음 노드 = ARROW / STOP / STATION 모두 포함
 # None / "ARROW" / "STOP" / "STATION"
 search_locked_target_type = None
 
 # 우회전 탐색 중 글씨 전체 노출 확인용
 search_text_full_count = 0
 search_text_candidate_type = None
-
-# 카운트 5 특수 동작 예약 플래그
-count5_special_pending = False
 
 # 카운트 4 이후 다음 화살표 전체 노출 확인용
 count4_arrow_full_frames = 0
@@ -1043,14 +1037,12 @@ def control_loop():
     global search_right_allowed, arrow_ir_expected
     global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
     global search_text_full_count, search_text_candidate_type
-    global count5_special_pending
     global count6_action_time
     global count4_arrow_full_frames
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     ir_stop_time = 0.0
     count3_action_time = 0.0
-    count5_action_time = 0.0
     count6_action_time = 0.0
     count6_phase_time = 0.0
 
@@ -1230,9 +1222,9 @@ def control_loop():
         # ----------------------------------------------------
         # GLOBAL IR COUNT
         #
-        # AUTO 시작 후 첫 1초만 제외하고,
-        # 이후에는 어떤 state에 있든 IR이 새 검은 표식을 밟으면
-        # 무조건 딱 1회 카운트한다.
+        # AUTO 시작 후 첫 1초 동안은 IR 센서값을 읽더라도
+        # 카운트만 증가시키지 않는다.
+        # 1초 이후에는 어떤 state에 있든 IR이 검은 표식을 밟으면 카운트한다.
         #
         # 같은 표식 중복 카운트는 ir_armed=False로 잠그고,
         # 흰 바닥을 IR_CLEAR_FRAMES 연속 확인한 뒤에만 재활성화한다.
@@ -1242,7 +1234,7 @@ def control_loop():
 
         if (
             auto_mode
-            and (now - auto_start_time) >= START_STRAIGHT_ONLY_SEC
+            and (now - auto_start_time) >= START_IR_COUNT_IGNORE_SEC
             and ir_armed
             and ir_hit
             and (now - last_ir_count_time) >= IR_COUNT_COOLDOWN_SEC
@@ -1321,16 +1313,18 @@ def control_loop():
                     state = "COUNT4_SEARCH_ARROW_RIGHT"
                     print("[COUNT 4] global IR -> search full arrow to the right")
 
-                # 카운트 6 특수동작 예약
+                # 카운트 6
+                # IR을 밟아 카운트가 6이 되면 즉시 정지한 뒤
+                # 오른쪽 1초 회전 -> 후진 1초 -> 정지 3초
                 elif ir_blob_count == 6:
-                    count5_special_pending = True
                     arrow_alignment_locked = True
                     search_locked_target_type = None
                     search_right_allowed = False
 
-                    ir_stop_time = time.time()
-                    state = "IR_CONTINUE"
-                    print("[COUNT 6] global IR -> station maneuver reserved")
+                    stop_robot()
+                    count6_phase_time = time.time()
+                    state = "COUNT6_TURN"
+                    print("[COUNT 6] stop -> right turn 1s -> reverse 1s -> stop 3s")
 
                 # 그 외 카운트는 기존 반복 로직처럼
                 # 1초 직진 후 다음 목표 탐색으로 이어간다.
@@ -1340,17 +1334,6 @@ def control_loop():
                     ir_stop_time = time.time()
                     state = "IR_CONTINUE"
                     print(f"[COUNT {ir_blob_count}] global IR -> 1.0s straight")
-
-            # ====================================================
-            # AUTO 시작 직후 1초
-            # IR/화살표/글씨 판단을 전부 무시하고 직진만 한다.
-            # 따라서 이 1초 동안은 IR 카운트가 절대 증가하지 않는다.
-            # ====================================================
-            elif time.time() - auto_start_time < START_STRAIGHT_ONLY_SEC:
-                state = "START"
-                arrow_ir_expected = False
-                search_locked_target_type = None
-                drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
 
             # ====================================================
             # START
@@ -1714,43 +1697,23 @@ def control_loop():
                     drive(FOLLOW_SPEED, FOLLOW_SPEED)
                 else:
                     stop_robot()
-
-                    if count5_special_pending and blob_count >= 6:
-                        # COUNT 6 전용: 우회전 1초 후 후진 1초
-                        count6_phase_time = time.time()
-                        state = "COUNT6_PRE_STOP"
-                        print("[COUNT 6] pre stop 1s -> turn")
-                    else:
-                        ir_stop_time = time.time()
-                        state = "IR_STOP"
+                    ir_stop_time = time.time()
+                    state = "IR_STOP"
 
             # ====================================================
             # COUNT 6 SPECIAL
-            # 6번째 IR에서만 실행:
-            # 정지 1초 -> 우회전 0.3초 -> 정지 1초 -> 후진 2초 -> 정지 3초
+            # 6번째 IR 카운트에서만 실행:
+            # 즉시 정지 -> 오른쪽 제자리 회전 1초
+            # -> 후진 1초 -> 정지 3초 -> 기존 주행 복귀
             # ====================================================
-            elif state == "COUNT6_PRE_STOP":
-                stop_robot()
-                if time.time() - count6_phase_time >= COUNT6_PRE_STOP_SEC:
-                    count6_phase_time = time.time()
-                    state = "COUNT6_TURN"
-                    print("[COUNT 6] pre stop done -> turn 0.3s")
-
             elif state == "COUNT6_TURN":
                 if time.time() - count6_phase_time < COUNT6_TURN_SEC:
                     drive(FOLLOW_SPEED, -FOLLOW_SPEED)
                 else:
                     stop_robot()
                     count6_phase_time = time.time()
-                    state = "COUNT6_POST_TURN_STOP"
-                    print("[COUNT 6] turn done -> stop 1s")
-
-            elif state == "COUNT6_POST_TURN_STOP":
-                stop_robot()
-                if time.time() - count6_phase_time >= COUNT6_POST_TURN_STOP_SEC:
-                    count6_phase_time = time.time()
                     state = "COUNT6_REVERSE"
-                    print("[COUNT 6] stop done -> reverse 2s")
+                    print("[COUNT 6] turn done -> reverse 1s")
 
             elif state == "COUNT6_REVERSE":
                 if time.time() - count6_phase_time < COUNT6_REVERSE_SEC:
@@ -1764,46 +1727,13 @@ def control_loop():
             elif state == "COUNT6_FINAL_STOP":
                 stop_robot()
                 if time.time() - count6_phase_time >= COUNT6_FINAL_STOP_SEC:
-                    count5_special_pending = False
                     arrow_alignment_locked = True
                     ir_armed = False
                     ir_clear_count = 0
                     search_right_allowed = True
                     search_locked_target_type = None
                     state = "FOLLOW"
-                    print("[COUNT 6] final stop done -> next count point")
-
-            # ====================================================
-            # COUNT 5 SPECIAL
-            # STOP/STATION을 향해 정렬한 방향을 유지한 채
-            # 1) 후진 1초
-            # 2) 정지 3초
-            # 3) 기존 SEARCH_RIGHT로 복귀
-            # ====================================================
-            elif state == "COUNT5_REVERSE":
-                if time.time() - count5_action_time < COUNT5_REVERSE_SEC:
-                    drive(-FOLLOW_SPEED, -FOLLOW_SPEED)
-                else:
-                    stop_robot()
-                    count5_action_time = time.time()
-                    state = "COUNT5_STOP"
-                    print("[COUNT 5] reverse done -> stop 3s")
-
-            elif state == "COUNT5_STOP":
-                stop_robot()
-
-                if time.time() - count5_action_time >= COUNT5_STOP_SEC:
-                    ir_armed = False
-                    ir_clear_count = 0
-                    arrow_ir_expected = False
-
-                    count5_special_pending = False
-                    search_right_allowed = True
-                    search_locked_target_type = None
-                    search_text_full_count = 0
-                    search_text_candidate_type = None
-                    state = "SEARCH_RIGHT"
-                    print("[COUNT 5] special maneuver done -> search next target")
+                    print("[COUNT 6] final stop done -> resume")
 
             elif state == "IR_STOP":
                 stop_robot()
@@ -1822,8 +1752,10 @@ def control_loop():
 
                 else:
                     # ------------------------------------------------
-                    # 화살표:
-                    # 기존처럼 보이면 바로 목표 후보로 사용 가능.
+                    # 다음 노드 후보 = ARROW / STOP / STATION
+                    #
+                    # ARROW:
+                    # 기존처럼 보이면 바로 다음 노드 후보로 사용 가능.
                     #
                     # STOP / STATION:
                     # 회전 중 글씨가 반쯤만 보일 때는 절대 바로 정렬하지 않는다.
@@ -2131,7 +2063,6 @@ def command(key):
     global search_right_allowed, arrow_ir_expected
     global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
     global search_text_full_count, search_text_candidate_type
-    global count5_special_pending
     global count6_action_time
     global count4_arrow_full_frames
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
@@ -2140,7 +2071,8 @@ def command(key):
         auto_mode = not auto_mode
 
         if auto_mode:
-            # AUTO를 켠 순간부터 첫 1초는 IR/목표를 무시하고 직진만 한다.
+            # AUTO를 켠 순간부터 첫 1초는 카메라 목표 인식은 그대로 사용하고,
+            # IR 센서 카운팅만 증가시키지 않는다.
             auto_start_time = time.time()
 
             # AUTO를 다시 켜도 Blob 카운트는 유지한다.
@@ -2165,7 +2097,6 @@ def command(key):
         search_locked_target_type = None
         search_text_full_count = 0
         search_text_candidate_type = None
-        count5_special_pending = False
         count4_arrow_full_frames = 0
         second_forward_trigger_count = 0
         second_ir_arrow_bottom = None
