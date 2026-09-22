@@ -128,9 +128,9 @@ COUNT5_REVERSE_SEC = 1.0
 COUNT5_STOP_SEC = 3.0
 
 # 카운트 6 전용 동작
-# 6번째 IR 감지 후: 1초 정지 -> 0.2 우회전 -> 1초 정지 -> 2초 후진 -> 3초 정지
+# 6번째 IR 감지 후: 1초 정지 -> 0.3 우회전 -> 1초 정지 -> 2초 후진 -> 3초 정지
 COUNT6_PRE_STOP_SEC = 1.0
-COUNT6_TURN_SEC = 0.2
+COUNT6_TURN_SEC = 0.3
 COUNT6_POST_TURN_STOP_SEC = 1.0
 COUNT6_REVERSE_SEC = 2.0
 COUNT6_FINAL_STOP_SEC = 3.0
