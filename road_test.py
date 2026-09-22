@@ -75,6 +75,9 @@ IR_THRESHOLD = 2600
 # IR 카운트가 한 번 증가하면 1.5초 동안 추가 카운트 금지
 IR_COUNT_COOLDOWN_SEC = 1.5
 
+# 카운트 6이 된 순간부터 5초 동안 추가 IR 카운팅 금지
+COUNT6_RECOUNT_LOCK_SEC = 5.0
+
 # AUTO 시작 직후 1초 동안은 목표/IR을 무시하고 직진만 한다.
 START_STRAIGHT_ONLY_SEC = 1.0
 
@@ -183,6 +186,9 @@ ir_clear_count = 0
 
 # 마지막 IR 카운트 시각
 last_ir_count_time = -999.0
+
+# 카운트 6 전용 재카운팅 금지 종료 시각
+count6_recount_lock_until = 0.0
 
 yolo_frame_count = 0
 last_yolo_text = None
@@ -1006,6 +1012,7 @@ def control_loop():
     global state, auto_mode, auto_start_time, latest_jpeg
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count, last_ir_count_time
+    global count6_recount_lock_until
     global lost_count, last_target
     global ir_armed, ir_clear_count, last_ir_count_time
     global yolo_frame_count, last_yolo_text, yolo_miss_count
@@ -1216,6 +1223,7 @@ def control_loop():
             and (now - auto_start_time) >= START_STRAIGHT_ONLY_SEC
             and ir_armed
             and ir_hit
+            and now >= count6_recount_lock_until
             and (now - last_ir_count_time) >= IR_COUNT_COOLDOWN_SEC
         ):
             blob_count += 1
@@ -1225,6 +1233,10 @@ def control_loop():
             # 카운트가 올라간 순간만 시간 저장.
             # 이후 1.5초 동안 센서가 계속 감지돼도 카운트는 증가하지 않는다.
             last_ir_count_time = now
+
+            if blob_count == 6:
+                count6_recount_lock_until = now + COUNT6_RECOUNT_LOCK_SEC
+                print("[COUNT 6] IR recount locked for 5.0s")
 
             print(
                 f"[GLOBAL IR COUNT] {blob_count} "
@@ -2097,7 +2109,8 @@ def video_feed():
 def command(key):
     global auto_mode, state, auto_start_time
     global manual_until, manual_cmd
-    global ir_armed, ir_clear_count
+    global ir_armed, ir_clear_count, last_ir_count_time
+    global count6_recount_lock_until
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed, arrow_ir_expected
     global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
@@ -2145,6 +2158,7 @@ def command(key):
         ir_armed = True
         ir_clear_count = 0
         last_ir_count_time = -999.0
+        count6_recount_lock_until = 0.0
         stop_robot()
 
     elif key == "space":
