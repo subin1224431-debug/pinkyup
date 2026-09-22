@@ -250,6 +250,10 @@ count5_special_pending = False
 count4_arrow_full_frames = 0
 COUNT4_ARROW_FULL_STABLE_FRAMES = 3
 
+# 일반 다음 노드 전체 형태 확인용
+next_node_arrow_full_frames = 0
+NEXT_NODE_FULL_STABLE_FRAMES = 3
+
 # 카운트 2 이후 거리 기반 직진용 상태값
 second_forward_trigger_count = 0
 second_ir_arrow_bottom = None
@@ -1024,6 +1028,7 @@ def control_loop():
     global count5_special_pending
     global count6_action_time
     global count4_arrow_full_frames
+    global next_node_arrow_full_frames
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     ir_stop_time = 0.0
@@ -1318,6 +1323,10 @@ def control_loop():
                 # 그 외 카운트는 기존 반복 로직처럼
                 # 1초 직진 후 다음 목표 탐색으로 이어간다.
                 else:
+                    next_node_arrow_full_frames = 0
+                    search_text_full_count = 0
+                    search_text_candidate_type = None
+
                     search_locked_target_type = None
                     search_right_allowed = False
                     ir_stop_time = time.time()
@@ -1798,6 +1807,70 @@ def control_loop():
                     search_text_candidate_type = None
                     state = "SEARCH_RIGHT"
 
+            elif state == "ALIGN_NEXT_NODE":
+                # 일반 다음 노드는 화살표/글씨 모두 중앙 정렬 후에만 주행한다.
+                if target is None:
+                    lost_count += 1
+
+                    if lost_count >= LOST_TARGET_FRAMES:
+                        lost_count = 0
+                        search_locked_target_type = None
+                        search_right_allowed = True
+                        next_node_arrow_full_frames = 0
+                        search_text_full_count = 0
+                        search_text_candidate_type = None
+                        state = "SEARCH_RIGHT"
+                        print("[NEXT NODE] node lost -> search full node again")
+
+                else:
+                    # 정렬 중에도 전체 형태가 깨지면 다시 탐색
+                    node_full = True
+
+                    if target.get("type") == "ARROW":
+                        node_full = not target.get("partial", False)
+                    else:
+                        fx1, fy1, fx2, fy2 = target.get(
+                            "frame_bbox",
+                            (0, 0, 0, 0)
+                        )
+                        node_full = (
+                            not target.get("clipped", False)
+                            and fx1 >= TEXT_FULL_MARGIN
+                            and fx2 <= (w - TEXT_FULL_MARGIN)
+                        )
+
+                    if not node_full:
+                        stop_robot()
+                        lost_count = 0
+                        search_locked_target_type = None
+                        search_right_allowed = True
+                        next_node_arrow_full_frames = 0
+                        search_text_full_count = 0
+                        search_text_candidate_type = None
+                        state = "SEARCH_RIGHT"
+                        print("[NEXT NODE] partial node -> search full shape again")
+                    else:
+                        lost_count = 0
+                        last_target = target
+
+                        target_x = target["center"][0] + ox
+                        error = target_x - (w / 2)
+
+                        if abs(error) <= CENTER_TOL:
+                            stop_robot()
+                            arrow_ir_expected = (
+                                target.get("type") == "ARROW"
+                            )
+                            state = "FOLLOW"
+                            print(
+                                f"[NEXT NODE] {target.get('type')} centered -> drive"
+                            )
+                        else:
+                            if error > 0:
+                                drive(ALIGN_SPEED, -ALIGN_SPEED)
+                            else:
+                                drive(-ALIGN_SPEED, ALIGN_SPEED)
+
             elif state == "SEARCH_RIGHT":
                 if not search_right_allowed:
                     drive(STRAIGHT_SPEED, STRAIGHT_SPEED)
@@ -1846,50 +1919,61 @@ def control_loop():
                         search_text_full_count = 0
                         search_text_candidate_type = None
 
-                    # 글씨는 "전체 노출 확인 완료"된 경우에만 후보가 된다.
-                    # 화살표는 기존처럼 바로 후보 가능.
-                    first_target = None
+                    # ------------------------------------------------
+                    # 모든 일반 다음 노드 탐색:
+                    # ARROW / STOP / STATION 모두 전체 형태가 안정적으로
+                    # 화면에 들어온 뒤에만 목표로 확정한다.
+                    # 확정 후에는 반드시 중앙 정렬을 끝낸 뒤 주행한다.
+                    # ------------------------------------------------
+                    full_arrow_target = None
 
-                    if full_text_target is not None and arrow_target is None:
-                        first_target = full_text_target
+                    if (
+                        arrow_target is not None
+                        and not arrow_target.get("partial", False)
+                    ):
+                        next_node_arrow_full_frames += 1
 
-                    elif arrow_target is not None and full_text_target is None:
-                        first_target = arrow_target
+                        if next_node_arrow_full_frames >= NEXT_NODE_FULL_STABLE_FRAMES:
+                            full_arrow_target = arrow_target
+                    else:
+                        next_node_arrow_full_frames = 0
 
-                    elif full_text_target is not None and arrow_target is not None:
-                        # 둘 다 유효한 상태라면 더 가까운 목표를 선택
+                    next_node_candidates = []
+
+                    if full_text_target is not None:
+                        next_node_candidates.append(full_text_target)
+
+                    if full_arrow_target is not None:
+                        next_node_candidates.append(full_arrow_target)
+
+                    if next_node_candidates:
                         first_target = max(
-                            [full_text_target, arrow_target],
+                            next_node_candidates,
                             key=lambda z: z["bbox"][1] + z["bbox"][3]
                         )
 
-                    if first_target is not None:
                         stop_robot()
                         last_target = first_target
                         lost_count = 0
                         search_right_allowed = False
-
                         search_locked_target_type = first_target.get("type")
 
-                        # 다음 탐색을 위해 글씨 확인 카운터 초기화
                         search_text_full_count = 0
                         search_text_candidate_type = None
+                        next_node_arrow_full_frames = 0
 
-                        if search_locked_target_type == "ARROW":
-                            arrow_ir_expected = True
-                            # 화살표는 미세정렬 없이 바로 추종
-                            state = "FOLLOW"
-                        else:
-                            arrow_ir_expected = False
-                            # STOP / STATION만 bbox 중심 미세정렬
-                            state = "ALIGN"
+                        arrow_ir_expected = (
+                            search_locked_target_type == "ARROW"
+                        )
+                        state = "ALIGN_NEXT_NODE"
 
                         print(
-                            f"[SEARCH] full target locked: "
-                            f"{search_locked_target_type}"
+                            f"[NEXT NODE] full target locked: "
+                            f"{search_locked_target_type} -> align"
                         )
                     else:
-                        # 아직 글씨 전체가 안 들어왔으면 계속 오른쪽으로 돌면서 더 본다.
+                        # 일부만 보이는 동안에는 절대 출발하지 않는다.
+                        # 계속 오른쪽으로 회전하며 전체 형태를 기다린다.
                         drive(SEARCH_SPEED, -SEARCH_SPEED)
 
         # ========================================================
@@ -2118,6 +2202,7 @@ def command(key):
     global count5_special_pending
     global count6_action_time
     global count4_arrow_full_frames
+    global next_node_arrow_full_frames
     global second_forward_trigger_count, second_ir_arrow_bottom, second_reference_acquired
 
     if key == "p":
@@ -2151,6 +2236,7 @@ def command(key):
         search_text_candidate_type = None
         count5_special_pending = False
         count4_arrow_full_frames = 0
+        next_node_arrow_full_frames = 0
         second_forward_trigger_count = 0
         second_ir_arrow_bottom = None
         second_reference_acquired = False
