@@ -120,17 +120,10 @@ LOST_TARGET_FRAMES = 5
 COUNT3_REVERSE_SEC = 1.0       # 카운트 3이 되는 순간 1초 후진
 COUNT3_STOP_SEC = 3.0          # 후진 후 3초 정지
 
-# 카운트 5 전용 동작
-# 기존처럼 IR 감지 후 1초 직진까지는 하고,
-# STOP/STATION을 향해 정렬한 방향을 그대로 유지한 채
-# 후진 1초 -> 3초 정지 후 다시 기존 다음 목표 탐색으로 복귀한다.
-COUNT5_REVERSE_SEC = 1.0
-COUNT5_STOP_SEC = 3.0
-
 # 카운트 6 전용 동작
-# 6번째 IR 감지 후: 1초 정지 -> 0.3 우회전 -> 1초 정지 -> 2초 후진 -> 3초 정지
+# 6번째 IR 감지 후: 1초 정지 -> 0.2 우회전 -> 1초 정지 -> 2초 후진 -> 3초 정지
 COUNT6_PRE_STOP_SEC = 1.0
-COUNT6_TURN_SEC = 0.3
+COUNT6_TURN_SEC = 0.2
 COUNT6_POST_TURN_STOP_SEC = 1.0
 COUNT6_REVERSE_SEC = 2.0
 COUNT6_FINAL_STOP_SEC = 3.0
@@ -243,8 +236,8 @@ search_locked_target_type = None
 search_text_full_count = 0
 search_text_candidate_type = None
 
-# 카운트 5 특수 동작 예약 플래그
-count5_special_pending = False
+# 카운트 6 특수 동작 예약 플래그
+count6_special_pending = False
 
 # 카운트 4 이후 다음 화살표 전체 노출 확인용
 count4_arrow_full_frames = 0
@@ -1026,7 +1019,7 @@ def control_loop():
     global search_right_allowed, arrow_ir_expected
     global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
     global search_text_full_count, search_text_candidate_type
-    global count5_special_pending
+    global count6_special_pending
     global count6_action_time
     global count4_arrow_full_frames
     global count7_arrow_full_frames
@@ -1034,7 +1027,6 @@ def control_loop():
 
     ir_stop_time = 0.0
     count3_action_time = 0.0
-    count5_action_time = 0.0
     count6_action_time = 0.0
     count6_phase_time = 0.0
 
@@ -1312,7 +1304,7 @@ def control_loop():
 
                 # 카운트 6 특수동작 예약
                 elif ir_blob_count == 6:
-                    count5_special_pending = True
+                    count6_special_pending = True
                     arrow_alignment_locked = True
                     search_locked_target_type = None
                     search_right_allowed = False
@@ -1718,7 +1710,7 @@ def control_loop():
                 else:
                     stop_robot()
 
-                    if count5_special_pending and blob_count >= 6:
+                    if count6_special_pending and blob_count >= 6:
                         # COUNT 6 전용: 우회전 1초 후 후진 1초
                         count6_phase_time = time.time()
                         state = "COUNT6_PRE_STOP"
@@ -1767,7 +1759,7 @@ def control_loop():
             elif state == "COUNT6_FINAL_STOP":
                 stop_robot()
                 if time.time() - count6_phase_time >= COUNT6_FINAL_STOP_SEC:
-                    count5_special_pending = False
+                    count6_special_pending = False
                     arrow_alignment_locked = True
                     ir_armed = False
                     ir_clear_count = 0
@@ -1865,38 +1857,6 @@ def control_loop():
                                 drive(ALIGN_SPEED, -ALIGN_SPEED)
                             else:
                                 drive(-ALIGN_SPEED, ALIGN_SPEED)
-
-            # ====================================================
-            # COUNT 5 SPECIAL
-            # STOP/STATION을 향해 정렬한 방향을 유지한 채
-            # 1) 후진 1초
-            # 2) 정지 3초
-            # 3) 기존 SEARCH_RIGHT로 복귀
-            # ====================================================
-            elif state == "COUNT5_REVERSE":
-                if time.time() - count5_action_time < COUNT5_REVERSE_SEC:
-                    drive(-FOLLOW_SPEED, -FOLLOW_SPEED)
-                else:
-                    stop_robot()
-                    count5_action_time = time.time()
-                    state = "COUNT5_STOP"
-                    print("[COUNT 5] reverse done -> stop 3s")
-
-            elif state == "COUNT5_STOP":
-                stop_robot()
-
-                if time.time() - count5_action_time >= COUNT5_STOP_SEC:
-                    ir_armed = False
-                    ir_clear_count = 0
-                    arrow_ir_expected = False
-
-                    count5_special_pending = False
-                    search_right_allowed = True
-                    search_locked_target_type = None
-                    search_text_full_count = 0
-                    search_text_candidate_type = None
-                    state = "SEARCH_RIGHT"
-                    print("[COUNT 5] special maneuver done -> search next target")
 
             elif state == "IR_STOP":
                 stop_robot()
@@ -2225,7 +2185,7 @@ def command(key):
     global search_right_allowed, arrow_ir_expected
     global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
     global search_text_full_count, search_text_candidate_type
-    global count5_special_pending
+    global count6_special_pending
     global count6_action_time
     global count4_arrow_full_frames
     global count7_arrow_full_frames
@@ -2260,7 +2220,7 @@ def command(key):
         search_locked_target_type = None
         search_text_full_count = 0
         search_text_candidate_type = None
-        count5_special_pending = False
+        count6_special_pending = False
         count4_arrow_full_frames = 0
         count7_arrow_full_frames = 0
         second_forward_trigger_count = 0
