@@ -73,7 +73,7 @@ MANUAL_PULSE = 0.30
 IR_THRESHOLD = 2600
 
 # IR 카운트가 한 번 증가하면 1.5초 동안 추가 카운트 금지
-IR_COUNT_COOLDOWN_SEC = 1.5
+IR_COUNT_COOLDOWN_SEC = 2.0
 
 # 카운트 6이 된 순간부터 5초 동안 추가 IR 카운팅 금지
 COUNT6_RECOUNT_LOCK_SEC = 5.0
