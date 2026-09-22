@@ -141,7 +141,7 @@ COUNT6_FINAL_STOP_SEC = 3.0
 # 값이 작을수록 화살표가 멀리 있을 때 일찍 우회전하고,
 # 값이 클수록 화살표에 더 가까이 간 뒤 늦게 우회전한다.
 # 예: 0.55 -> 일찍, 0.65 -> 중간, 0.75 -> 늦게
-SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.29
+SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.27
 
 # 카운트 2를 밟은 직후 화면 아래에 남아 있는 "방금 밟은 화살표"와
 # 앞쪽의 다음 화살표를 구분하기 위한 점프 기준. ROI 높이의 이 비율 이상
