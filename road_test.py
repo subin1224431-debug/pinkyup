@@ -1194,6 +1194,9 @@ def control_loop():
             ir_r >= IR_THRESHOLD
         )
 
+        # 카운팅은 가운데 IR 센서만 사용
+        ir_count_hit = (ir_c >= IR_THRESHOLD)
+
         # ----------------------------------------------------
         # IR 재활성화 로직
         # 한 번 검은 표식에서 멈춘 직후에는 IR을 잠시 무시한다.
@@ -1227,7 +1230,7 @@ def control_loop():
             auto_mode
             and (now - auto_start_time) >= START_STRAIGHT_ONLY_SEC
             and ir_armed
-            and ir_hit
+            and ir_count_hit
             and now >= count6_recount_lock_until
             and (now - last_ir_count_time) >= IR_COUNT_COOLDOWN_SEC
         ):
