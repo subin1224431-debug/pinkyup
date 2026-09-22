@@ -72,8 +72,8 @@ MANUAL_PULSE = 0.30
 # IR threshold
 IR_THRESHOLD = 2600
 
-# IR 카운트가 한 번 증가하면 1.5초 동안 추가 카운트 금지
-IR_COUNT_COOLDOWN_SEC = 1.5
+# IR 카운트가 한 번 증가하면 2초 동안 추가 카운트 금지
+IR_COUNT_COOLDOWN_SEC = 2.0
 
 # 카운트 6이 된 순간부터 5초 동안 추가 IR 카운팅 금지
 COUNT6_RECOUNT_LOCK_SEC = 5.0
@@ -1237,7 +1237,7 @@ def control_loop():
             global_ir_count_event = True
 
             # 카운트가 올라간 순간만 시간 저장.
-            # 이후 1.5초 동안 센서가 계속 감지돼도 카운트는 증가하지 않는다.
+            # 이후 2초 동안 센서가 계속 감지돼도 카운트는 증가하지 않는다.
             last_ir_count_time = now
 
             if blob_count == 6:
@@ -1321,12 +1321,23 @@ def control_loop():
                     state = "IR_CONTINUE"
                     print("[COUNT 6] global IR -> station maneuver reserved")
 
+                # 카운트 7:
+                # COUNT 6 이후 다시 직진하다가 IR을 밟아 7이 되는 순간
+                # 바로 오른쪽으로 회전하며 다음 화살표를 탐색한다.
+                elif ir_blob_count == 7:
+                    stop_robot()
+                    count7_arrow_full_frames = 0
+                    search_text_full_count = 0
+                    search_text_candidate_type = None
+                    search_locked_target_type = None
+                    search_right_allowed = True
+                    arrow_ir_expected = False
+                    state = "COUNT7_SEARCH_ARROW_RIGHT"
+                    print("[COUNT 7] global IR -> search full arrow to the right")
+
                 # 그 외 카운트는 기존 반복 로직처럼
                 # 1초 직진 후 다음 목표 탐색으로 이어간다.
                 else:
-                    if ir_blob_count == 7:
-                        count7_arrow_full_frames = 0
-
                     search_locked_target_type = None
                     search_right_allowed = False
                     ir_stop_time = time.time()
@@ -1760,26 +1771,27 @@ def control_loop():
                     arrow_alignment_locked = True
                     ir_armed = False
                     ir_clear_count = 0
-                    search_right_allowed = True
+
+                    # COUNT 6이 끝났다고 바로 다음 노드를 탐색하지 않는다.
+                    # 다시 직진해서 다음 IR 표식을 밟아 COUNT 7이 될 때까지 간다.
+                    search_right_allowed = False
                     search_locked_target_type = None
                     state = "FOLLOW"
-                    print("[COUNT 6] final stop done -> next count point")
+                    print("[COUNT 6] final stop done -> drive straight until COUNT 7")
 
             # ====================================================
-            # COUNT 7 -> NEXT ARROW ALIGN
-            # 전체 화살표 확인 후 중앙 정렬, 정렬 완료 후에만 주행
+            # COUNT 7 -> NEXT ARROW SEARCH
+            # COUNT 7이 되는 순간부터 오른쪽으로 회전하면서
+            # 다음 화살표 전체 형태가 보일 때까지 기다린다.
+            # STOP / STATION은 COUNT 7 탐색 목표로 사용하지 않는다.
             # ====================================================
-            elif state == "COUNT7_ALIGN_ARROW":
-                if arrow_target is None:
-                    count7_arrow_full_frames = 0
-                    search_locked_target_type = None
-                    search_right_allowed = True
-                    state = "SEARCH_RIGHT"
+            elif state == "COUNT7_SEARCH_ARROW_RIGHT":
+                full_arrow_visible = False
 
-                else:
+                if arrow_target is not None:
                     ax, ay, aw, ah = arrow_target["bbox"]
 
-                    count7_arrow_fully_inside = (
+                    full_arrow_visible = (
                         not arrow_target.get("partial", False)
                         and ax >= COUNT7_ARROW_FULL_MARGIN
                         and ay >= COUNT7_ARROW_FULL_MARGIN
@@ -1787,14 +1799,54 @@ def control_loop():
                         and (ay + ah) <= (roi.shape[0] - COUNT7_ARROW_FULL_MARGIN)
                     )
 
-                    # 정렬 중 다시 일부만 보이면 탐색부터 다시
-                    if not count7_arrow_fully_inside:
+                if full_arrow_visible:
+                    count7_arrow_full_frames += 1
+                else:
+                    count7_arrow_full_frames = 0
+
+                if count7_arrow_full_frames >= COUNT7_ARROW_FULL_STABLE_FRAMES:
+                    stop_robot()
+                    last_target = arrow_target
+                    lost_count = 0
+                    count7_arrow_full_frames = 0
+                    search_locked_target_type = "ARROW"
+                    search_right_allowed = False
+                    state = "COUNT7_ALIGN_ARROW"
+                    print("[COUNT 7] full arrow confirmed -> align center")
+                else:
+                    drive(SEARCH_SPEED, -SEARCH_SPEED)
+
+            # ====================================================
+            # COUNT 7 -> NEXT ARROW ALIGN
+            # 화살표 전체 형태가 유지되는 동안 중앙 정렬하고,
+            # 중앙 정렬 완료 후에만 직진한다.
+            # ====================================================
+            elif state == "COUNT7_ALIGN_ARROW":
+                if arrow_target is None:
+                    count7_arrow_full_frames = 0
+                    search_locked_target_type = None
+                    search_right_allowed = True
+                    state = "COUNT7_SEARCH_ARROW_RIGHT"
+
+                else:
+                    ax, ay, aw, ah = arrow_target["bbox"]
+
+                    full_arrow_visible = (
+                        not arrow_target.get("partial", False)
+                        and ax >= COUNT7_ARROW_FULL_MARGIN
+                        and ay >= COUNT7_ARROW_FULL_MARGIN
+                        and (ax + aw) <= (roi.shape[1] - COUNT7_ARROW_FULL_MARGIN)
+                        and (ay + ah) <= (roi.shape[0] - COUNT7_ARROW_FULL_MARGIN)
+                    )
+
+                    # 정렬 중 화살표가 다시 잘려 보이면 탐색부터 다시 한다.
+                    if not full_arrow_visible:
                         stop_robot()
                         count7_arrow_full_frames = 0
                         search_locked_target_type = None
                         search_right_allowed = True
-                        state = "SEARCH_RIGHT"
-                        print("[COUNT 7] arrow became partial -> search again")
+                        state = "COUNT7_SEARCH_ARROW_RIGHT"
+                        print("[COUNT 7] arrow partial again -> search again")
 
                     else:
                         target_x = arrow_target["center"][0] + ox
@@ -1807,7 +1859,7 @@ def control_loop():
                             search_locked_target_type = "ARROW"
                             search_right_allowed = False
                             state = "FOLLOW"
-                            print("[COUNT 7] full arrow centered -> FOLLOW")
+                            print("[COUNT 7] full arrow centered -> drive straight")
                         else:
                             if error > 0:
                                 drive(ALIGN_SPEED, -ALIGN_SPEED)
@@ -1906,44 +1958,20 @@ def control_loop():
 
                     # 글씨는 "전체 노출 확인 완료"된 경우에만 후보가 된다.
                     # 화살표는 기존처럼 바로 후보 가능.
-                    # 단, COUNT 7의 다음 화살표만은 전체 형태가 충분히
-                    # 화면 안쪽에 들어온 상태를 5프레임 연속 확인한 뒤 사용한다.
                     first_target = None
 
-                    if blob_count == 7 and arrow_target is not None:
-                        ax, ay, aw, ah = arrow_target["bbox"]
+                    if full_text_target is not None and arrow_target is None:
+                        first_target = full_text_target
 
-                        count7_arrow_fully_inside = (
-                            not arrow_target.get("partial", False)
-                            and ax >= COUNT7_ARROW_FULL_MARGIN
-                            and ay >= COUNT7_ARROW_FULL_MARGIN
-                            and (ax + aw) <= (roi.shape[1] - COUNT7_ARROW_FULL_MARGIN)
-                            and (ay + ah) <= (roi.shape[0] - COUNT7_ARROW_FULL_MARGIN)
+                    elif arrow_target is not None and full_text_target is None:
+                        first_target = arrow_target
+
+                    elif full_text_target is not None and arrow_target is not None:
+                        # 둘 다 유효한 상태라면 더 가까운 목표를 선택
+                        first_target = max(
+                            [full_text_target, arrow_target],
+                            key=lambda z: z["bbox"][1] + z["bbox"][3]
                         )
-
-                        if count7_arrow_fully_inside:
-                            count7_arrow_full_frames += 1
-                        else:
-                            count7_arrow_full_frames = 0
-
-                        if count7_arrow_full_frames >= COUNT7_ARROW_FULL_STABLE_FRAMES:
-                            first_target = arrow_target
-
-                    else:
-                        count7_arrow_full_frames = 0
-
-                        if full_text_target is not None and arrow_target is None:
-                            first_target = full_text_target
-
-                        elif arrow_target is not None and full_text_target is None:
-                            first_target = arrow_target
-
-                        elif full_text_target is not None and arrow_target is not None:
-                            # 둘 다 유효한 상태라면 더 가까운 목표를 선택
-                            first_target = max(
-                                [full_text_target, arrow_target],
-                                key=lambda z: z["bbox"][1] + z["bbox"][3]
-                            )
 
                     if first_target is not None:
                         stop_robot()
@@ -1959,17 +1987,11 @@ def control_loop():
 
                         if search_locked_target_type == "ARROW":
                             arrow_ir_expected = True
-
-                            if blob_count == 7:
-                                count7_arrow_full_frames = 0
-                                state = "COUNT7_ALIGN_ARROW"
-                                print("[COUNT 7] full arrow confirmed -> align")
-                            else:
-                                # 다른 카운트의 기존 화살표 동작은 그대로
-                                state = "FOLLOW"
+                            # 화살표는 미세정렬 없이 바로 추종
+                            state = "FOLLOW"
                         else:
                             arrow_ir_expected = False
-                            # STOP / STATION 기존 동작 그대로
+                            # STOP / STATION만 bbox 중심 미세정렬
                             state = "ALIGN"
 
                         print(
@@ -1977,8 +1999,7 @@ def control_loop():
                             f"{search_locked_target_type}"
                         )
                     else:
-                        # COUNT7에서는 화살표 일부만 보이면 계속 회전하며
-                        # 전체 형태가 화면 안쪽에 들어올 때까지 기다린다.
+                        # 아직 글씨 전체가 안 들어왔으면 계속 오른쪽으로 돌면서 더 본다.
                         drive(SEARCH_SPEED, -SEARCH_SPEED)
 
         # ========================================================
