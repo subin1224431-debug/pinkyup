@@ -53,10 +53,8 @@ if not os.path.exists(MODEL_PATH):
         f"{MODEL_PATH} 파일이 없습니다. road_test.py와 best.pt를 같은 폴더에 넣어주세요."
     )
 
-print("Loading YOLO model...")
-yolo_model = YOLO(MODEL_PATH)
-print("YOLO model loaded.")
-print("YOLO classes:", yolo_model.names)
+# YOLO는 COUNT 2가 된 이후에 한 번만 로드한다.
+yolo_model = None
 
 
 # Motor speed
@@ -74,6 +72,9 @@ IR_THRESHOLD = 2600
 
 # IR 카운트가 한 번 증가하면 2초 동안 추가 카운트 금지
 IR_COUNT_COOLDOWN_SEC = 2.0
+
+# 카운트 5가 된 순간부터 4초 동안 추가 IR 카운팅 금지
+COUNT5_RECOUNT_LOCK_SEC = 4.0
 
 # 카운트 6이 된 순간부터 5초 동안 추가 IR 카운팅 금지
 COUNT6_RECOUNT_LOCK_SEC = 5.0
@@ -121,9 +122,9 @@ COUNT3_REVERSE_SEC = 1.0       # 카운트 3이 되는 순간 1초 후진
 COUNT3_STOP_SEC = 3.0          # 후진 후 3초 정지
 
 # 카운트 6 전용 동작
-# 6번째 IR 감지 후: 1초 정지 -> 0.6 우회전 -> 1초 정지 -> 2초 후진 -> 3초 정지
+# 6번째 IR 감지 후: 1초 정지 -> 0.2 우회전 -> 1초 정지 -> 2초 후진 -> 3초 정지
 COUNT6_PRE_STOP_SEC = 1.0
-COUNT6_TURN_SEC = 0.6
+COUNT6_TURN_SEC = 0.2
 COUNT6_POST_TURN_STOP_SEC = 1.0
 COUNT6_REVERSE_SEC = 2.0
 COUNT6_FINAL_STOP_SEC = 3.0
@@ -140,7 +141,7 @@ COUNT6_FINAL_STOP_SEC = 3.0
 # 값이 작을수록 화살표가 멀리 있을 때 일찍 우회전하고,
 # 값이 클수록 화살표에 더 가까이 간 뒤 늦게 우회전한다.
 # 예: 0.55 -> 일찍, 0.65 -> 중간, 0.75 -> 늦게
-SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.27
+SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.29
 
 # 카운트 2를 밟은 직후 화면 아래에 남아 있는 "방금 밟은 화살표"와
 # 앞쪽의 다음 화살표를 구분하기 위한 점프 기준. ROI 높이의 이 비율 이상
@@ -179,6 +180,9 @@ ir_clear_count = 0
 
 # 마지막 IR 카운트 시각
 last_ir_count_time = -999.0
+
+# 카운트 5 전용 재카운팅 금지 종료 시각
+count5_recount_lock_until = 0.0
 
 # 카운트 6 전용 재카운팅 금지 종료 시각
 count6_recount_lock_until = 0.0
@@ -729,6 +733,8 @@ def stabilize_text_target(prev, current):
     return out
 
 def detect_text_yolo(frame, ox, oy):
+    global yolo_model
+
     """
     STOP / STATION은 YOLO로 검출한다.
 
@@ -1010,9 +1016,10 @@ def control_loop():
     global state, auto_mode, auto_start_time, latest_jpeg
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count, last_ir_count_time
-    global count6_recount_lock_until
+    global count5_recount_lock_until, count6_recount_lock_until
     global lost_count, last_target
     global ir_armed, ir_clear_count, last_ir_count_time
+    global yolo_model
     global yolo_frame_count, last_yolo_text, yolo_miss_count
     global last_stable_yolo_text, yolo_partial_count, last_text_mask_targets
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
@@ -1053,39 +1060,60 @@ def control_loop():
         # 화살표 검출을 수행한다.
         # 따라서 글씨 이진화와 YOLO가 서로 충돌하지 않는다.
         # ----------------------------------------------------
-        yolo_frame_count += 1
         detected_text_masks = []
 
-        if yolo_frame_count % YOLO_EVERY == 0:
-            try:
-                detected_text, detected_text_masks = detect_text_yolo(frame, ox, oy)
-                last_text_mask_targets = detected_text_masks
+        # YOLO는 COUNT 2가 된 이후부터만 실행한다.
+        if blob_count >= 2:
+            if yolo_model is None:
+                try:
+                    print("Loading YOLO model after COUNT 2...")
+                    yolo_model = YOLO(MODEL_PATH)
+                    print("YOLO model loaded.")
+                    print("YOLO classes:", yolo_model.names)
+                except Exception as e:
+                    print("YOLO LOAD ERROR:", e)
+                    yolo_model = None
 
-                if detected_text is not None:
-                    yolo_miss_count = 0
+            if yolo_model is not None:
+                yolo_frame_count += 1
 
-                    # 현재 프레임의 bbox를 계속 따라가도록 갱신
-                    last_stable_yolo_text = stabilize_text_target(
-                        last_stable_yolo_text,
-                        detected_text
-                    )
-                    last_yolo_text = last_stable_yolo_text
+                if yolo_frame_count % YOLO_EVERY == 0:
+                    try:
+                        detected_text, detected_text_masks = detect_text_yolo(frame, ox, oy)
+                        last_text_mask_targets = detected_text_masks
 
-                    if detected_text.get("clipped", False):
-                        yolo_partial_count += 1
-                    else:
-                        yolo_partial_count = 0
+                        if detected_text is not None:
+                            yolo_miss_count = 0
 
-                else:
-                    # 이번 프레임에서 글씨를 못 잡으면
-                    # 이전 위치를 붙잡아 두지 않고 즉시 해제
-                    yolo_miss_count += 1
-                    last_yolo_text = None
-                    last_stable_yolo_text = None
-                    yolo_partial_count = 0
+                            # 현재 프레임의 bbox를 계속 따라가도록 갱신
+                            last_stable_yolo_text = stabilize_text_target(
+                                last_stable_yolo_text,
+                                detected_text
+                            )
+                            last_yolo_text = last_stable_yolo_text
 
-            except Exception as e:
-                print("YOLO ERROR:", e)
+                            if detected_text.get("clipped", False):
+                                yolo_partial_count += 1
+                            else:
+                                yolo_partial_count = 0
+
+                        else:
+                            # 이번 프레임에서 글씨를 못 잡으면
+                            # 이전 위치를 붙잡아 두지 않고 즉시 해제
+                            yolo_miss_count += 1
+                            last_yolo_text = None
+                            last_stable_yolo_text = None
+                            yolo_partial_count = 0
+
+                    except Exception as e:
+                        print("YOLO ERROR:", e)
+        else:
+            # COUNT 0~1에서는 YOLO 관련 결과를 사용하지 않는다.
+            last_yolo_text = None
+            last_stable_yolo_text = None
+            last_text_mask_targets = []
+            yolo_miss_count = 0
+            yolo_partial_count = 0
 
         text_target = last_yolo_text
 
@@ -1221,6 +1249,7 @@ def control_loop():
             and (now - auto_start_time) >= START_STRAIGHT_ONLY_SEC
             and ir_armed
             and ir_hit
+            and now >= count5_recount_lock_until
             and now >= count6_recount_lock_until
             and (now - last_ir_count_time) >= IR_COUNT_COOLDOWN_SEC
         ):
@@ -1231,6 +1260,10 @@ def control_loop():
             # 카운트가 올라간 순간만 시간 저장.
             # 이후 2초 동안 센서가 계속 감지돼도 카운트는 증가하지 않는다.
             last_ir_count_time = now
+
+            if blob_count == 5:
+                count5_recount_lock_until = now + COUNT5_RECOUNT_LOCK_SEC
+                print("[COUNT 5] IR recount locked for 4.0s")
 
             if blob_count == 6:
                 count6_recount_lock_until = now + COUNT6_RECOUNT_LOCK_SEC
@@ -2180,7 +2213,7 @@ def command(key):
     global auto_mode, state, auto_start_time
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count, last_ir_count_time
-    global count6_recount_lock_until
+    global count5_recount_lock_until, count6_recount_lock_until
     global blob_count, blob_count_armed, blob_ir_passed, blob_missing_frames, ir_blob_count
     global search_right_allowed, arrow_ir_expected
     global repeat_ir_cycle, search_locked_target_type, arrow_alignment_locked
@@ -2230,6 +2263,7 @@ def command(key):
         ir_armed = True
         ir_clear_count = 0
         last_ir_count_time = -999.0
+        count5_recount_lock_until = 0.0
         count6_recount_lock_until = 0.0
         stop_robot()
 
