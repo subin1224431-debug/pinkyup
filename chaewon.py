@@ -188,7 +188,7 @@ def detect_text(frame, name):
 # =========================
 while True:
 
-    frame = camera.value
+    frame = camera.get_frame()
 
     if frame is None:
         continue
