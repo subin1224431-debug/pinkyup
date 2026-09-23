@@ -997,9 +997,7 @@ def control_loop():
             # ================================================
             elif drive_state == "DRIVE_TEXT":
 
-
-
-                elif text_target is not None:
+                if text_target is not None:
                     text_x = (
                         text_target["center"][0]
                     )
