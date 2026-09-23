@@ -2175,7 +2175,7 @@ if __name__ == "__main__":
     
     # 노트북에서 보내는 시작 신호 대기 스레드 실행
     threading.Thread(
-        target=zmq_wait_for_start,
+        target=wait_for_signals,
         daemon=True
     ).start()
 
