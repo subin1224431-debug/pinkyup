@@ -185,9 +185,6 @@ def zmq_wait_for_start():
             print("[핑키봇] START_AUTONAV 수신 -> AUTO 시작")
             auto_mode = True
             drive_state = "CENTERLINE"
-mission_step = 0
-TURN_RIGHT_TIME = 1.5
-TURN_SPEED_SLOW = 12
 
     except Exception as e:
         print("[ZMQ] 대기 스레드 오류:", e)
@@ -1086,9 +1083,6 @@ def control_loop():
                     text_seen_this_cycle = False
 
                     drive_state = "CENTERLINE"
-mission_step = 0
-TURN_RIGHT_TIME = 1.5
-TURN_SPEED_SLOW = 12
 
                     print(
                         "[IR] 3s stop done -> CENTERLINE / "
@@ -1417,9 +1411,6 @@ def command(key):
 
         if auto_mode:
             drive_state = "CENTERLINE"
-mission_step = 0
-TURN_RIGHT_TIME = 1.5
-TURN_SPEED_SLOW = 12
 
             if not initial_25s_done:
                 auto_start_time = time.time()
@@ -1433,9 +1424,6 @@ TURN_SPEED_SLOW = 12
     elif key == "r":
         auto_mode = False
         drive_state = "CENTERLINE"
-mission_step = 0
-TURN_RIGHT_TIME = 1.5
-TURN_SPEED_SLOW = 12
 
         last_error = 0
         state_start_time = 0.0
