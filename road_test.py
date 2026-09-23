@@ -111,17 +111,22 @@ TEXT_FULL_STABLE_FRAMES = 3
 # 이 기준선은 화면에는 표시하지 않는다.
 TEXT_ALIGN_TRIGGER_RATIO = 0.60
 
+# 글씨 bbox 밑부분이 화면 하단에 도달했을 때
+# 정지 후 오른쪽으로 0.6초 제자리 회전
+TEXT_BOTTOM_TURN_SEC = 0.6
+
 # 글씨 bbox의 가장 아래(y2)가 카메라 화면의 가장 아래에 닿았다고
 # 판단하는 비율. 완전한 1.00은 검출 흔들림 때문에 놓칠 수 있어
 # 화면 높이의 98% 이상이면 '밑부분 도달'로 판단한다.
 TEXT_BOTTOM_TRIGGER_RATIO = 0.98
 
 # 글씨가 화면 아래까지 도달한 뒤 동작
-FORWARD_AFTER_TEXT_SEC = 3.0
+FORWARD_AFTER_TEXT_SEC = 2.0
 STOP_AFTER_TEXT_SEC = 3.0
 
 text_full_count = 0
 text_candidate_type = None
+current_text_type = None
 
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(
@@ -396,6 +401,7 @@ def control_loop():
 
     global text_full_count
     global text_candidate_type
+    global current_text_type
 
     global auto_start_time
     global initial_25s_done
@@ -639,7 +645,8 @@ def control_loop():
                 "CENTERLINE",
                 "SEARCH_TEXT",
                 "APPROACH_TEXT",
-                "DRIVE_TEXT"
+                "DRIVE_TEXT",
+                "TEXT_BOTTOM_TURN"
             )
         ):
             try:
@@ -760,6 +767,7 @@ def control_loop():
                 else:
 
                     if text_target is not None:
+                        current_text_type = text_target["type"]
                         drive_state = "APPROACH_TEXT"
 
                         print(
@@ -870,6 +878,7 @@ def control_loop():
                 if full_text_target is not None:
                     stop_robot()
 
+                    current_text_type = full_text_target["type"]
                     drive_state = "APPROACH_TEXT"
 
                     print(
@@ -972,25 +981,30 @@ def control_loop():
                     )
 
                     # 글씨 박스 밑부분이 화면 밑부분에 닿으면
-                    # 글씨 추종 종료 -> 3초 직진
+                    # 글씨 추종 종료 -> 2초 직진
                     if (
                         text_y2
                         >= int(
                             h * TEXT_BOTTOM_TRIGGER_RATIO
                         )
                     ):
-                        drive(
-                            TEXT_FOLLOW_SPEED,
-                            TEXT_FOLLOW_SPEED
-                        )
-
+                        stop_robot()
                         state_start_time = time.time()
-                        drive_state = "FORWARD_3SEC"
 
-                        print(
-                            f"[YOLO] {text_target['type']} bbox bottom reached screen bottom "
-                            "-> forward 3.0s"
-                        )
+                        if current_text_type == "STATION":
+                            drive_state = "TEXT_BOTTOM_TURN"
+
+                            print(
+                                "[YOLO] STATION bbox bottom reached screen bottom "
+                                "-> stop / right turn 0.6s"
+                            )
+                        else:
+                            drive_state = "FORWARD_2SEC"
+
+                            print(
+                                "[YOLO] STOP bbox bottom reached screen bottom "
+                                "-> forward 2.0s"
+                            )
 
                     else:
                         corr = np.clip(
@@ -1014,6 +1028,33 @@ def control_loop():
                     )
 
             # ================================================
+            # TEXT_BOTTOM_TURN
+            #
+            # 글씨 bbox 밑부분이 화면 하단에 닿으면 먼저 정지하고,
+            # 오른쪽으로 0.6초 제자리 회전한 뒤 2초 직진한다.
+            # ================================================
+            elif drive_state == "TEXT_BOTTOM_TURN":
+
+                if (
+                    time.time()
+                    - state_start_time
+                    < TEXT_BOTTOM_TURN_SEC
+                ):
+                    drive(
+                        TURN_SPEED,
+                        -TURN_SPEED
+                    )
+
+                else:
+                    stop_robot()
+                    state_start_time = time.time()
+                    drive_state = "FORWARD_2SEC"
+
+                    print(
+                        "[TEXT] right turn 0.6s done -> forward 2.0s"
+                    )
+
+            # ================================================
             # FORWARD_2SEC
             # ================================================
             elif drive_state == "FORWARD_2SEC":
@@ -1034,7 +1075,7 @@ def control_loop():
                     drive_state = "STOP_3SEC"
 
                     print(
-                        "[TEXT] forward 3.0s done -> stop 3.0s"
+                        "[TEXT] forward 2.0s done -> stop 3.0s"
                     )
 
             # ================================================
@@ -1049,6 +1090,7 @@ def control_loop():
                     - state_start_time
                     >= STOP_AFTER_TEXT_SEC
                 ):
+                    current_text_type = None
                     drive_state = "CENTERLINE"
 
                     print(
@@ -1378,6 +1420,7 @@ def command(key):
 
         text_full_count = 0
         text_candidate_type = None
+        current_text_type = None
 
         stop_robot()
 
