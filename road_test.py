@@ -127,10 +127,15 @@ print("YOLO classes:", yolo_model.names)
 # ============================================================
 IR_THRESHOLD = 2600
 
+# YOLO 글씨가 너무 멀리 있을 때 IR을 미리 받지 않도록,
+# 글씨 bbox의 아래쪽이 화면 높이의 75% 이상 내려왔을 때부터
+# '다음 최초 IR 1회'를 기다린다.
+IR_ARM_TEXT_BOTTOM_RATIO = 0.75
+
 yolo_ir_waiting = False
 yolo_ir_consumed = False
 
-IR_REVERSE_SEC = 2.0
+IR_REVERSE_SEC = 1.0
 IR_STOP_SEC = 3.0
 
 
@@ -769,17 +774,19 @@ def control_loop():
 
                     if (
                         text_target is not None
-                        and not yolo_ir_waiting
                         and not yolo_ir_consumed
                     ):
                         stop_robot()
 
-                        yolo_ir_waiting = True
+                        # 아직 IR 대기는 켜지지 않는다.
+                        # 글씨가 카메라 화면에 충분히 가까워진 뒤
+                        # DRIVE_TEXT에서 IR 대기를 활성화한다.
+                        yolo_ir_waiting = False
                         drive_state = "ALIGN_TEXT"
 
                         print(
                             f"[YOLO] next {text_target['type']} detected "
-                            "during CENTERLINE -> ALIGN_TEXT / wait next IR"
+                            "during CENTERLINE -> ALIGN_TEXT"
                         )
 
                     elif error is not None:
@@ -885,14 +892,15 @@ def control_loop():
                 if full_text_target is not None:
                     stop_robot()
 
-                    if not yolo_ir_consumed:
-                        yolo_ir_waiting = True
-
+                    # 글씨를 찾았다고 바로 IR을 받지 않는다.
+                    # 먼저 글씨로 접근하고, 충분히 가까워졌을 때만
+                    # 다음 최초 IR 1회를 기다린다.
+                    yolo_ir_waiting = False
                     drive_state = "ALIGN_TEXT"
 
                     print(
                         f"[YOLO] {full_text_target['type']} "
-                        "full -> ALIGN_TEXT / IR waiting"
+                        "full -> ALIGN_TEXT"
                     )
 
                 else:
@@ -945,12 +953,43 @@ def control_loop():
             # ================================================
             elif drive_state == "DRIVE_TEXT":
 
-                # YOLO 이후 다음 IR 1회만 사용
+                # ------------------------------------------------
+                # 글씨가 카메라 화면에 충분히 가까워졌을 때만
+                # IR 대기를 켠다.
+                #
+                # 기준:
+                # YOLO bbox의 아래쪽(y2)이 화면 높이의 75% 이상
+                # ------------------------------------------------
+                if (
+                    text_target is not None
+                    and not yolo_ir_waiting
+                    and not yolo_ir_consumed
+                ):
+                    _, _, _, text_y2 = (
+                        text_target["bbox"]
+                    )
+
+                    if (
+                        text_y2
+                        >= int(
+                            h * IR_ARM_TEXT_BOTTOM_RATIO
+                        )
+                    ):
+                        yolo_ir_waiting = True
+
+                        print(
+                            f"[YOLO] {text_target['type']} is close "
+                            "-> wait for FIRST IR"
+                        )
+
+                # 가까워진 뒤에 들어오는 '첫 IR 1회'만 사용
                 if (
                     yolo_ir_waiting
                     and not yolo_ir_consumed
                     and ir_hit
                 ):
+                    stop_robot()
+
                     yolo_ir_waiting = False
                     yolo_ir_consumed = True
 
@@ -963,7 +1002,7 @@ def control_loop():
                     drive_state = "REVERSE_IR"
 
                     print(
-                        "[IR] FIRST IR after YOLO -> reverse 2.0s"
+                        "[IR] FIRST IR after close YOLO -> reverse 1.0s"
                     )
 
                 elif text_target is not None:
@@ -989,8 +1028,8 @@ def control_loop():
                     )
 
                 else:
-                    # 글씨가 아래로 빠진 후에도
-                    # 다음 IR 1회까지 직진
+                    # 글씨가 잠깐 화면에서 빠져도 계속 직진.
+                    # IR은 글씨가 가까워진 뒤 대기 ON 된 경우에만 사용.
                     drive(
                         TEXT_FOLLOW_SPEED,
                         TEXT_FOLLOW_SPEED
@@ -1018,7 +1057,7 @@ def control_loop():
                     drive_state = "STOP_3SEC"
 
                     print(
-                        "[IR] reverse done -> stop 3.0s"
+                        "[IR] reverse 1.0s done -> stop 3.0s"
                     )
 
             # ================================================
@@ -1187,7 +1226,7 @@ def control_loop():
 
         cv2.putText(
             result,
-            f"IR AFTER YOLO: {yolo_ir_waiting and not yolo_ir_consumed}",
+            f"IR AFTER CLOSE YOLO: {yolo_ir_waiting and not yolo_ir_consumed}",
             (12, 108),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.46,
