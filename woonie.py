@@ -274,8 +274,16 @@ def wait_for_signals():
     while True:
         try:
             data = client_socket.recv(1024).decode('utf-8').strip()
-            if not data:
-                break # 연결이 끊기면 루프 종료
+            # 노트북이 보낸 자동 시작 신호를 받았을 때
+            if data == "START_AUTONAV" or data == "p":
+                print("[핑키봇] 노트북으로부터 주행 시작 명령을 받았습니다. 즉시 주행 시작!")
+                auto_mode = True
+                auto_start_time = time.time()
+                state = "START"
+
+            # 숫자(YOLO 카운트)를 받았을 때 (LCD 출력)
+            else:
+                pass
                 
             # 1. 주행 시작 신호를 받았을 때 (기존 ZMQ 응답 대체)
             if "START" in data:
