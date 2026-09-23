@@ -103,9 +103,13 @@ TEXT_CLASSES = {"STOP", "STATION"}
 TEXT_FULL_MARGIN = 35
 TEXT_FULL_STABLE_FRAMES = 3
 
-# 중심선 추종 중 YOLO 글씨가 보여도 바로 글씨 추종으로 바꾸지 않는다.
-# 글씨 bbox의 아래쪽(y2)이 전체 화면 높이의 60% 지점까지 내려오면
-# 그때 중심선 추종을 멈추고 글씨 중심 정렬을 시작한다.
+# YOLO 글씨를 찾은 뒤부터 60% 지점까지는 도로 중심선이 아니라
+# 글씨의 중심점을 '가상 중심선'처럼 사용한다.
+# 글씨가 좌우로 치우쳐 있으면 제자리 회전으로 정면을 맞추고,
+# 글씨가 화면 중앙에 들어온 경우에만 천천히 전진한다.
+# 60% 지점에 도달했을 때도 중앙 정렬이 완료되어 있어야
+# DRIVE_TEXT로 넘어가 글씨 x 중심 기준으로 직진한다.
+# 이 기준선은 화면에는 표시하지 않는다.
 TEXT_ALIGN_TRIGGER_RATIO = 0.60
 
 text_full_count = 0
@@ -643,6 +647,7 @@ def control_loop():
             and drive_state in (
                 "CENTERLINE",
                 "SEARCH_TEXT",
+                "APPROACH_TEXT",
                 "ALIGN_TEXT",
                 "DRIVE_TEXT"
             )
@@ -772,8 +777,9 @@ def control_loop():
 
                 # ------------------------------------------------
                 # 최초 25초 과정이 끝난 뒤:
-                # 시간 제한 없이 계속 중심선 추종
-                # 다음 STOP/STATION이 보이면 다시 YOLO 정렬/직진
+                # 평소에는 중심선 추종.
+                # 다음 STOP/STATION 글씨가 보이면 그때부터는
+                # 도로 중심선이 아니라 글씨 중심점을 기준으로 접근.
                 # ------------------------------------------------
                 else:
 
@@ -782,81 +788,13 @@ def control_loop():
                         and not yolo_ir_consumed
                     ):
                         text_seen_this_cycle = True
+                        yolo_ir_waiting = False
+                        drive_state = "APPROACH_TEXT"
 
-                        _, _, _, text_y2 = (
-                            text_target["bbox"]
+                        print(
+                            f"[YOLO] next {text_target['type']} detected "
+                            "-> APPROACH_TEXT"
                         )
-
-                        # 글씨가 아직 멀리 있으면 중심선 추종 계속.
-                        # YOLO bbox 아래쪽이 화면 높이의 60% 선까지 내려오면
-                        # 그때 정지하고 글씨 중심 정렬로 전환.
-                        if (
-                            text_y2
-                            >= int(
-                                h * TEXT_ALIGN_TRIGGER_RATIO
-                            )
-                        ):
-                            stop_robot()
-
-                            yolo_ir_waiting = False
-                            drive_state = "ALIGN_TEXT"
-
-                            print(
-                                f"[YOLO] {text_target['type']} reached "
-                                "60% screen line -> ALIGN_TEXT"
-                            )
-
-                        elif error is not None:
-                            correction = (
-                                KP * error
-                            )
-
-                            left_speed = (
-                                BASE_SPEED
-                                + correction
-                            )
-
-                            right_speed = (
-                                BASE_SPEED
-                                - correction
-                            )
-
-                            left_speed = int(
-                                np.clip(
-                                    left_speed,
-                                    0,
-                                    MAX_SPEED
-                                )
-                            )
-
-                            right_speed = int(
-                                np.clip(
-                                    right_speed,
-                                    0,
-                                    MAX_SPEED
-                                )
-                            )
-
-                            drive(
-                                left_speed,
-                                right_speed
-                            )
-
-                        else:
-                            if last_error < 0:
-                                drive(
-                                    0,
-                                    SEARCH_SPEED
-                                )
-
-                            elif last_error > 0:
-                                drive(
-                                    SEARCH_SPEED,
-                                    0
-                                )
-
-                            else:
-                                stop_robot()
 
                     elif error is not None:
                         correction = (
@@ -961,16 +899,13 @@ def control_loop():
                 if full_text_target is not None:
                     stop_robot()
 
-                    # 글씨를 찾았다고 바로 IR을 받지 않는다.
-                    # 먼저 글씨로 접근하고, 충분히 가까워졌을 때만
-                    # 다음 최초 IR 1회를 기다린다.
                     yolo_ir_waiting = False
                     text_seen_this_cycle = True
-                    drive_state = "ALIGN_TEXT"
+                    drive_state = "APPROACH_TEXT"
 
                     print(
                         f"[YOLO] {full_text_target['type']} "
-                        "full -> ALIGN_TEXT"
+                        "full -> APPROACH_TEXT"
                     )
 
                 else:
@@ -978,6 +913,76 @@ def control_loop():
                         TURN_SPEED,
                         -TURN_SPEED
                     )
+
+            # ================================================
+            # APPROACH_TEXT
+            #
+            # 글씨가 보인 뒤부터 60% 지점까지:
+            # 도로 중심선 대신 글씨 중심점을 기준으로 접근한다.
+            #
+            # - 글씨 중심이 화면 중앙에서 벗어나면 제자리 회전
+            # - 중앙에 들어오면 천천히 직진
+            # - 60% 지점까지 이 과정을 반복해 글씨를 정면에 유지
+            # - 60% 지점 도달 시 중앙 정렬이 완료되어 있으면 DRIVE_TEXT
+            # ================================================
+            elif drive_state == "APPROACH_TEXT":
+
+                if text_target is None:
+                    stop_robot()
+                    drive_state = "SEARCH_TEXT"
+
+                else:
+                    text_seen_this_cycle = True
+
+                    text_x = (
+                        text_target["center"][0]
+                    )
+
+                    _, _, _, text_y2 = (
+                        text_target["bbox"]
+                    )
+
+                    text_error = (
+                        text_x
+                        - w // 2
+                    )
+
+                    if abs(text_error) > CENTER_TOL:
+                        # 아직 글씨가 정면이 아니므로 전진하지 않고
+                        # 제자리에서 방향만 맞춘다.
+                        if text_error > 0:
+                            drive(
+                                ALIGN_SPEED,
+                                -ALIGN_SPEED
+                            )
+                        else:
+                            drive(
+                                -ALIGN_SPEED,
+                                ALIGN_SPEED
+                            )
+
+                    else:
+                        # 글씨 중심이 정면에 들어왔을 때만 접근
+                        if (
+                            text_y2
+                            < int(
+                                h * TEXT_ALIGN_TRIGGER_RATIO
+                            )
+                        ):
+                            drive(
+                                TEXT_FOLLOW_SPEED,
+                                TEXT_FOLLOW_SPEED
+                            )
+
+                        else:
+                            # 60% 지점까지 왔고 중심 정렬도 완료
+                            stop_robot()
+                            drive_state = "DRIVE_TEXT"
+
+                            print(
+                                f"[YOLO] {text_target['type']} "
+                                "front-centered at 60% -> DRIVE_TEXT"
+                            )
 
             # ================================================
             # ALIGN_TEXT
@@ -1206,34 +1211,6 @@ def control_loop():
                 (0, 255, 255),
                 -1
             )
-
-        text_align_line_y = int(
-            h * TEXT_ALIGN_TRIGGER_RATIO
-        )
-
-        cv2.line(
-            result,
-            (0, text_align_line_y),
-            (w, text_align_line_y),
-            (0, 165, 255),
-            2
-        )
-
-        cv2.putText(
-            result,
-            "TEXT ALIGN 60%",
-            (
-                10,
-                max(
-                    20,
-                    text_align_line_y - 8
-                )
-            ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (0, 165, 255),
-            2
-        )
 
         if text_target is not None:
             x1, y1, x2, y2 = (
