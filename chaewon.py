@@ -68,7 +68,7 @@ ALIGN_SPEED = 10
 MANUAL_SPEED = 24
 MANUAL_PULSE = 0.30
 
-# IR threshold
+# IR removed - camera arrow trigger mode
 IR_THRESHOLD = 2600
 
 # IR 카운트가 한 번 증가하면 2초 동안 추가 카운트 금지
@@ -125,13 +125,6 @@ KP_ALIGN = 0.11
 KP_FOLLOW = 0.10
 MAX_CORR = 10
 
-# Search behavior
-IR_STOP_SEC = 0.45
-IR_COUNT_STOP_SEC = 0.18      # IR이 화살표를 밟으면 카운트 후 잠깐 정차
-IR_AFTER_HIT_DRIVE_SEC = 1.0   # STOP/STATION 이후 기존 동작용
-IR_CLEAR_FRAMES = 12           # 검은 표식에서 완전히 벗어난 뒤 재활성화 (중복 카운트 방지)
-IR_EVENT_LOCK_SEC = 1.5        # 카운트 직후 같은 화살표 재인식 방지
-LOST_TARGET_FRAMES = 5
 
 # 카운트 3 전용 동작
 COUNT3_REVERSE_SEC = 1.0       # 카운트 3이 되는 순간 1초 후진
@@ -194,17 +187,6 @@ last_target = None
 ir_armed = True
 ir_clear_count = 0
 
-# 마지막 IR 카운트 시각
-last_ir_count_time = -999.0
-
-# IR 카운트 직후 일시 잠금 시간
-ir_event_lock_until = 0.0
-
-# 카운트 5 전용 재카운팅 금지 종료 시각
-count5_recount_lock_until = 0.0
-
-# 카운트 6 전용 재카운팅 금지 종료 시각
-count6_recount_lock_until = 0.0
 
 yolo_frame_count = 0
 last_yolo_text = None
@@ -230,7 +212,7 @@ TEXT_MAX_JUMP = 180          # 실제 이동은 허용하고 비정상적인 큰
 # ----------------------------
 blob_count = 0
 
-# 카운트는 IR 센서가 실제 화살표를 밟았을 때만 증가한다.
+# 카운트는 카메라 화살표 bbox trigger 기반으로 증가한다.
 # 같은 검은 표식을 여러 번 세지 않는 역할은 ir_armed가 담당한다.
 blob_count_armed = True
 blob_ir_passed = False
@@ -238,15 +220,6 @@ blob_missing_frames = 0
 
 ir_blob_count = 0
 
-# 오른쪽 회전 허용 플래그
-search_right_allowed = False
-
-# 화살표를 카메라로 따라가기 시작한 뒤, 화면에서 사라져도
-# 다음 IR hit를 해당 화살표 통과로 인정하기 위한 latch
-arrow_ir_expected = False
-
-# IR -> 1초 직진 -> 우회전 탐색을 반복하는 후속 구간 상태
-repeat_ir_cycle = False
 
 # IR 카운트 직후 다음 IR 카운트 전까지 화살표 정렬 금지
 arrow_alignment_locked = False
@@ -298,6 +271,37 @@ def arrow_reach_trigger(arrow_target, roi_height):
     bottom = y + h
 
     return bottom >= int(roi_height * ARROW_TRIGGER_Y_RATIO)
+
+
+
+# ============================================================
+# FINAL MODE : Camera Arrow Trigger + STOP/STATION Sequence
+# ============================================================
+# 화살표는 밟음(IR)이 아니라 solid blob bbox bottom으로 판단
+# STOP/STATION은 YOLO bbox 기반 정렬 후 3초 정지
+# ============================================================
+
+FINAL_STOP_HOLD_SEC = 3.0
+FINAL_STATION_HOLD_SEC = 3.0
+FINAL_STATION_TURN_DEG_TIME = 0.9
+
+arrow_camera_count = 0
+arrow_bottom_trigger_lock = False
+
+def camera_arrow_trigger(target, frame_height):
+    if target is None:
+        return False
+    x, y, w, h = target["bbox"]
+    return (y + h) >= int(frame_height * 0.78)
+
+# ============================================================
+# FINAL_SEQUENCE_CONFIG_V3
+# STOP -> 3s hold -> arrow disappearance drive -> 80deg turn -> STATION
+# Arrow trigger uses blob bbox bottom, not IR.
+# ============================================================
+FINAL_STOP_HOLD_SEC = 3.0
+FINAL_STATION_HOLD_SEC = 3.0
+STATION_TURN_TIME = 0.9
 
 # ============================================================
 # Motor helpers
