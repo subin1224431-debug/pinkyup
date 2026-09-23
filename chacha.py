@@ -122,21 +122,28 @@ last_cmd_right = 0.0
 # 실제 코스에서 원하는 STATION 위치의 VIRTUAL X / Y / TH 값을 확인한 뒤
 # STATION_COORD_ENABLED = True 로 바꾸고 목표값을 넣으면 된다.
 # ============================================================
-STATION_COORD_ENABLED = False
+STATION_COORD_ENABLED = True
 
-STATION_TARGET_X = 0.0
-STATION_TARGET_Y = 0.0
-STATION_TARGET_TH_DEG = 0.0
+STATION_TARGET_X = 2.31
+STATION_TARGET_Y = -0.31
+STATION_TARGET_TH_DEG = -239.31
 
 STATION_X_TOL = 0.25
 STATION_Y_TOL = 0.25
 STATION_TH_TOL_DEG = 15.0
 
+# STATION 가상좌표 도달 시 전용 동작
+# 기존 STATION YOLO 타이밍 로직과 별개로,
+# 좌표 도달 시에는 아래 순서만 실행한다.
+STATION_COORD_TURN_SEC = 0.4
+STATION_COORD_FORWARD_SEC = 2.0
+
 station_coord_triggered = False
 
 
 # ============================================================
-# YOLO STOP / STATION
+# YOLO STOP / 이후 글씨
+# STATION 전용 동작은 가상좌표로 처리
 # ============================================================
 MODEL_PATH = "best_ncnn_model"
 YOLO_CONF = 0.45
@@ -158,17 +165,6 @@ TEXT_FULL_STABLE_FRAMES = 3
 # DRIVE_TEXT로 상태만 전환하고 같은 방식으로 계속 접근한다.
 # 이 기준선은 화면에는 표시하지 않는다.
 TEXT_ALIGN_TRIGGER_RATIO = 0.60
-
-# 글씨 bbox 밑부분이 화면 하단에 도달했을 때
-# 정지 후 오른쪽으로 0.6초 제자리 회전
-TEXT_BOTTOM_TURN_SEC = 0.6
-
-# STATION은 bbox 하단 도달 직후 바로 회전하지 않고
-# 1초 더 직진한 뒤 오른쪽으로 0.6초 제자리 회전
-STATION_PRE_TURN_FORWARD_SEC = 1.0
-
-# STATION은 0.6초 우회전 후 2초 직진
-STATION_FORWARD_AFTER_TURN_SEC = 2.0
 
 # 글씨 bbox의 가장 아래(y2)가 카메라 화면의 가장 아래에 닿았다고
 # 판단하는 비율. 완전한 1.00은 검출 흔들림 때문에 놓칠 수 있어
@@ -774,13 +770,16 @@ def control_loop():
 
         if (
             initial_25s_done
-            and drive_state in (
-                "CENTERLINE",
-                "SEARCH_TEXT",
-                "APPROACH_TEXT",
-                "DRIVE_TEXT",
-                "STATION_PRE_TURN_FORWARD",
-                "TEXT_BOTTOM_TURN"
+            and (
+                drive_state in (
+                    "SEARCH_TEXT",
+                    "APPROACH_TEXT",
+                    "DRIVE_TEXT"
+                )
+                or (
+                    station_coord_triggered
+                    and drive_state == "CENTERLINE"
+                )
             )
         ):
             try:
@@ -895,9 +894,16 @@ def control_loop():
                 # ------------------------------------------------
                 # 최초 25초 과정이 끝난 뒤:
                 #
-                # STOP 이벤트가 끝난 뒤부터는 다시 도로 중심선 추종.
-                # STATION은 YOLO를 보고 바로 꺾지 않고,
-                # 설정된 가상좌표에 도달할 때까지 중심선 추종을 유지한다.
+                # STOP 이벤트 완료 후에는 중심선 추종.
+                # STATION 가상좌표에 도달하기 전까지도 계속 중심선 추종.
+                #
+                # STATION 좌표 도달:
+                # 정지 -> 오른쪽 0.4초 제자리 회전
+                # -> 2초 직진 -> 3초 정지
+                # -> 다시 중심선 추종
+                #
+                # 이후에는 중심선 추종 중 다음 YOLO 글씨를 인식하면
+                # 기존 글씨 접근/처리 로직을 다시 수행한다.
                 # ------------------------------------------------
                 else:
 
@@ -907,18 +913,27 @@ def control_loop():
                         and station_virtual_coordinate_reached()
                     ):
                         station_coord_triggered = True
-                        current_text_type = "STATION"
+                        current_text_type = "STATION_COORD"
 
-                        # STATION 가상좌표에 도달하면 여기서 STATION 전용 동작 시작.
-                        # 기존에 정한 STATION 동작:
-                        # 1초 추가 직진 -> 오른쪽 0.6초 제자리 회전
-                        # -> 2초 직진 -> 3초 정지 -> 중심선 추종
+                        stop_robot()
                         state_start_time = time.time()
-                        drive_state = "STATION_PRE_TURN_FORWARD"
+                        drive_state = "STATION_COORD_TURN"
 
                         print(
                             "[VIRTUAL] STATION coordinate reached "
-                            "-> STATION_PRE_TURN_FORWARD"
+                            "-> stop / right turn 0.4s"
+                        )
+
+                    elif (
+                        station_coord_triggered
+                        and text_target is not None
+                    ):
+                        current_text_type = text_target["type"]
+                        drive_state = "APPROACH_TEXT"
+
+                        print(
+                            f"[YOLO] next {text_target['type']} detected "
+                            "after STATION -> APPROACH_TEXT"
                         )
 
                     elif error is not None:
@@ -1147,20 +1162,12 @@ def control_loop():
                         stop_robot()
                         state_start_time = time.time()
 
-                        if current_text_type == "STATION":
-                            drive_state = "STATION_PRE_TURN_FORWARD"
+                        drive_state = "FORWARD_2SEC"
 
-                            print(
-                                "[YOLO] STATION bbox bottom reached screen bottom "
-                                "-> forward 1.0s before right turn"
-                            )
-                        else:
-                            drive_state = "FORWARD_2SEC"
-
-                            print(
-                                "[YOLO] STOP bbox bottom reached screen bottom "
-                                "-> forward 3.0s"
-                            )
+                        print(
+                            f"[YOLO] {current_text_type} bbox bottom reached screen bottom "
+                            "-> forward"
+                        )
 
                     else:
                         corr = np.clip(
@@ -1184,46 +1191,16 @@ def control_loop():
                     )
 
             # ================================================
-            # STATION_PRE_TURN_FORWARD
+            # STATION_COORD_TURN
             #
-            # STATION bbox 하단이 화면 하단에 도달한 뒤
-            # 바로 회전하지 않고 1초 더 직진한다.
-            # 그 다음 오른쪽 0.6초 제자리 회전으로 넘어간다.
+            # 좌표 도달 즉시 정지한 뒤 오른쪽으로 0.4초 제자리 회전
             # ================================================
-            elif drive_state == "STATION_PRE_TURN_FORWARD":
+            elif drive_state == "STATION_COORD_TURN":
 
                 if (
                     time.time()
                     - state_start_time
-                    < STATION_PRE_TURN_FORWARD_SEC
-                ):
-                    drive(
-                        TEXT_FOLLOW_SPEED,
-                        TEXT_FOLLOW_SPEED
-                    )
-
-                else:
-                    stop_robot()
-                    state_start_time = time.time()
-                    drive_state = "TEXT_BOTTOM_TURN"
-
-                    print(
-                        "[STATION] extra forward 1.0s done "
-                        "-> right turn 0.6s"
-                    )
-
-            # ================================================
-            # TEXT_BOTTOM_TURN
-            #
-            # 글씨 bbox 밑부분이 화면 하단에 닿으면 먼저 정지하고,
-            # 오른쪽으로 0.6초 제자리 회전한 뒤 2초 직진한다.
-            # ================================================
-            elif drive_state == "TEXT_BOTTOM_TURN":
-
-                if (
-                    time.time()
-                    - state_start_time
-                    < TEXT_BOTTOM_TURN_SEC
+                    < STATION_COORD_TURN_SEC
                 ):
                     drive(
                         TURN_SPEED,
@@ -1233,26 +1210,22 @@ def control_loop():
                 else:
                     stop_robot()
                     state_start_time = time.time()
-                    drive_state = "FORWARD_2SEC"
+                    drive_state = "STATION_COORD_FORWARD"
 
                     print(
-                        "[TEXT] right turn 0.6s done -> forward 3.0s"
+                        "[STATION COORD] right turn 0.4s done "
+                        "-> forward 2.0s"
                     )
 
             # ================================================
-            # FORWARD_2SEC
+            # STATION_COORD_FORWARD
             # ================================================
-            elif drive_state == "FORWARD_2SEC":
-
-                if current_text_type == "STATION":
-                    forward_duration = 2.0
-                else:
-                    forward_duration = 3.0
+            elif drive_state == "STATION_COORD_FORWARD":
 
                 if (
                     time.time()
                     - state_start_time
-                    < forward_duration
+                    < STATION_COORD_FORWARD_SEC
                 ):
                     drive(
                         TEXT_FOLLOW_SPEED,
@@ -1265,7 +1238,32 @@ def control_loop():
                     drive_state = "STOP_3SEC"
 
                     print(
-                        f"[TEXT] forward {forward_duration:.1f}s done "
+                        "[STATION COORD] forward 2.0s done "
+                        "-> stop 3.0s"
+                    )
+
+            # ================================================
+            # FORWARD_2SEC
+            # ================================================
+            elif drive_state == "FORWARD_2SEC":
+
+                if (
+                    time.time()
+                    - state_start_time
+                    < FORWARD_AFTER_TEXT_SEC
+                ):
+                    drive(
+                        TEXT_FOLLOW_SPEED,
+                        TEXT_FOLLOW_SPEED
+                    )
+
+                else:
+                    stop_robot()
+                    state_start_time = time.time()
+                    drive_state = "STOP_3SEC"
+
+                    print(
+                        f"[TEXT] forward {FORWARD_AFTER_TEXT_SEC:.1f}s done "
                         "-> stop 3.0s"
                     )
 
@@ -1281,7 +1279,6 @@ def control_loop():
                     - state_start_time
                     >= STOP_AFTER_TEXT_SEC
                 ):
-                    current_text_type = None
                     current_text_type = None
                     drive_state = "CENTERLINE"
 
