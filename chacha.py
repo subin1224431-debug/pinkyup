@@ -1499,7 +1499,7 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-threading.Thread(
+    threading.Thread(
         target=control_loop,
         daemon=True
     ).start()
