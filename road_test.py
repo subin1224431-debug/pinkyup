@@ -38,17 +38,17 @@ LAPTOP_ZMQ_PORT = 6000
 # ============================================================
 # 주행 설정
 # ============================================================
-BASE_SPEED = 25
+BASE_SPEED = 20
 KP = 0.12
-MAX_SPEED = 40
-SEARCH_SPEED = 18
+MAX_SPEED = 32
+SEARCH_SPEED = 14
 
-TEXT_FOLLOW_SPEED = 19
+TEXT_FOLLOW_SPEED = 16
 TEXT_FOLLOW_KP = 0.10
 TEXT_FOLLOW_MAX_CORR = 10
 
-TURN_SPEED = 30
-ALIGN_SPEED = 10
+TURN_SPEED = 24
+ALIGN_SPEED = 8
 CENTER_TOL = 30
 
 
@@ -104,7 +104,7 @@ arrow_count_armed = True
 # ============================================================
 # 3번째 화살표 거리 기준
 # ============================================================
-THIRD_ARROW_TRIGGER_RATIO = 0.26
+THIRD_ARROW_TRIGGER_RATIO = 0.15
 THIRD_ARROW_TRIGGER_FRAMES = 2
 third_arrow_trigger_count = 0
 
