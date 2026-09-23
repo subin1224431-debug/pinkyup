@@ -282,7 +282,7 @@ def zmq_wait_for_start():
 
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
-    socket.connect("tcp://192.168.4.20:6000")  # 노트북의 와이파이 IP
+    socket.connect("tcp://172.20.10.14:6000")  # 노트북의 와이파이 IP
 
     print("[핑키봇] 노트북(서버)에 접속 및 대기 해제 신호를 보냅니다...")
     socket.send_string("핑키봇 준비 완료!")
