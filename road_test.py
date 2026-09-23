@@ -103,6 +103,11 @@ TEXT_CLASSES = {"STOP", "STATION"}
 TEXT_FULL_MARGIN = 35
 TEXT_FULL_STABLE_FRAMES = 3
 
+# 중심선 추종 중 YOLO 글씨가 보여도 바로 글씨 추종으로 바꾸지 않는다.
+# 글씨 bbox의 아래쪽(y2)이 전체 화면 높이의 60% 지점까지 내려오면
+# 그때 중심선 추종을 멈추고 글씨 중심 정렬을 시작한다.
+TEXT_ALIGN_TRIGGER_RATIO = 0.60
+
 text_full_count = 0
 text_candidate_type = None
 
@@ -776,19 +781,82 @@ def control_loop():
                         text_target is not None
                         and not yolo_ir_consumed
                     ):
-                        stop_robot()
-
-                        # 아직 IR 대기는 켜지지 않는다.
-                        # 글씨가 카메라 화면에 충분히 가까워진 뒤
-                        # DRIVE_TEXT에서 IR 대기를 활성화한다.
-                        yolo_ir_waiting = False
                         text_seen_this_cycle = True
-                        drive_state = "ALIGN_TEXT"
 
-                        print(
-                            f"[YOLO] next {text_target['type']} detected "
-                            "during CENTERLINE -> ALIGN_TEXT"
+                        _, _, _, text_y2 = (
+                            text_target["bbox"]
                         )
+
+                        # 글씨가 아직 멀리 있으면 중심선 추종 계속.
+                        # YOLO bbox 아래쪽이 화면 높이의 60% 선까지 내려오면
+                        # 그때 정지하고 글씨 중심 정렬로 전환.
+                        if (
+                            text_y2
+                            >= int(
+                                h * TEXT_ALIGN_TRIGGER_RATIO
+                            )
+                        ):
+                            stop_robot()
+
+                            yolo_ir_waiting = False
+                            drive_state = "ALIGN_TEXT"
+
+                            print(
+                                f"[YOLO] {text_target['type']} reached "
+                                "60% screen line -> ALIGN_TEXT"
+                            )
+
+                        elif error is not None:
+                            correction = (
+                                KP * error
+                            )
+
+                            left_speed = (
+                                BASE_SPEED
+                                + correction
+                            )
+
+                            right_speed = (
+                                BASE_SPEED
+                                - correction
+                            )
+
+                            left_speed = int(
+                                np.clip(
+                                    left_speed,
+                                    0,
+                                    MAX_SPEED
+                                )
+                            )
+
+                            right_speed = int(
+                                np.clip(
+                                    right_speed,
+                                    0,
+                                    MAX_SPEED
+                                )
+                            )
+
+                            drive(
+                                left_speed,
+                                right_speed
+                            )
+
+                        else:
+                            if last_error < 0:
+                                drive(
+                                    0,
+                                    SEARCH_SPEED
+                                )
+
+                            elif last_error > 0:
+                                drive(
+                                    SEARCH_SPEED,
+                                    0
+                                )
+
+                            else:
+                                stop_robot()
 
                     elif error is not None:
                         correction = (
@@ -1138,6 +1206,34 @@ def control_loop():
                 (0, 255, 255),
                 -1
             )
+
+        text_align_line_y = int(
+            h * TEXT_ALIGN_TRIGGER_RATIO
+        )
+
+        cv2.line(
+            result,
+            (0, text_align_line_y),
+            (w, text_align_line_y),
+            (0, 165, 255),
+            2
+        )
+
+        cv2.putText(
+            result,
+            "TEXT ALIGN 60%",
+            (
+                10,
+                max(
+                    20,
+                    text_align_line_y - 8
+                )
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 165, 255),
+            2
+        )
 
         if text_target is not None:
             x1, y1, x2, y2 = (
