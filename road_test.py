@@ -115,6 +115,13 @@ TEXT_ALIGN_TRIGGER_RATIO = 0.60
 # 정지 후 오른쪽으로 0.6초 제자리 회전
 TEXT_BOTTOM_TURN_SEC = 0.6
 
+# STATION은 bbox 하단 도달 직후 바로 회전하지 않고
+# 1초 더 직진한 뒤 오른쪽으로 0.6초 제자리 회전
+STATION_PRE_TURN_FORWARD_SEC = 1.0
+
+# STATION은 0.6초 우회전 후 2초 직진
+STATION_FORWARD_AFTER_TURN_SEC = 2.0
+
 # 글씨 bbox의 가장 아래(y2)가 카메라 화면의 가장 아래에 닿았다고
 # 판단하는 비율. 완전한 1.00은 검출 흔들림 때문에 놓칠 수 있어
 # 화면 높이의 98% 이상이면 '밑부분 도달'로 판단한다.
@@ -646,6 +653,7 @@ def control_loop():
                 "SEARCH_TEXT",
                 "APPROACH_TEXT",
                 "DRIVE_TEXT",
+                "STATION_PRE_TURN_FORWARD",
                 "TEXT_BOTTOM_TURN"
             )
         ):
@@ -992,11 +1000,11 @@ def control_loop():
                         state_start_time = time.time()
 
                         if current_text_type == "STATION":
-                            drive_state = "TEXT_BOTTOM_TURN"
+                            drive_state = "STATION_PRE_TURN_FORWARD"
 
                             print(
                                 "[YOLO] STATION bbox bottom reached screen bottom "
-                                "-> stop / right turn 0.6s"
+                                "-> forward 1.0s before right turn"
                             )
                         else:
                             drive_state = "FORWARD_2SEC"
@@ -1025,6 +1033,35 @@ def control_loop():
                     drive(
                         TEXT_FOLLOW_SPEED,
                         TEXT_FOLLOW_SPEED
+                    )
+
+            # ================================================
+            # STATION_PRE_TURN_FORWARD
+            #
+            # STATION bbox 하단이 화면 하단에 도달한 뒤
+            # 바로 회전하지 않고 1초 더 직진한다.
+            # 그 다음 오른쪽 0.6초 제자리 회전으로 넘어간다.
+            # ================================================
+            elif drive_state == "STATION_PRE_TURN_FORWARD":
+
+                if (
+                    time.time()
+                    - state_start_time
+                    < STATION_PRE_TURN_FORWARD_SEC
+                ):
+                    drive(
+                        TEXT_FOLLOW_SPEED,
+                        TEXT_FOLLOW_SPEED
+                    )
+
+                else:
+                    stop_robot()
+                    state_start_time = time.time()
+                    drive_state = "TEXT_BOTTOM_TURN"
+
+                    print(
+                        "[STATION] extra forward 1.0s done "
+                        "-> right turn 0.6s"
                     )
 
             # ================================================
@@ -1059,10 +1096,15 @@ def control_loop():
             # ================================================
             elif drive_state == "FORWARD_2SEC":
 
+                if current_text_type == "STATION":
+                    forward_duration = STATION_FORWARD_AFTER_TURN_SEC
+                else:
+                    forward_duration = FORWARD_AFTER_TEXT_SEC
+
                 if (
                     time.time()
                     - state_start_time
-                    < FORWARD_AFTER_TEXT_SEC
+                    < forward_duration
                 ):
                     drive(
                         TEXT_FOLLOW_SPEED,
@@ -1075,7 +1117,8 @@ def control_loop():
                     drive_state = "STOP_3SEC"
 
                     print(
-                        "[TEXT] forward 3.0s done -> stop 3.0s"
+                        f"[TEXT] forward {forward_duration:.1f}s done "
+                        "-> stop 3.0s"
                     )
 
             # ================================================
