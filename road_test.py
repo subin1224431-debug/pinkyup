@@ -117,7 +117,7 @@ TEXT_ALIGN_TRIGGER_RATIO = 0.60
 TEXT_BOTTOM_TRIGGER_RATIO = 0.98
 
 # 글씨가 화면 아래까지 도달한 뒤 동작
-FORWARD_AFTER_TEXT_SEC = 2.0
+FORWARD_AFTER_TEXT_SEC = 3.0
 STOP_AFTER_TEXT_SEC = 3.0
 
 text_full_count = 0
@@ -972,7 +972,7 @@ def control_loop():
                     )
 
                     # 글씨 박스 밑부분이 화면 밑부분에 닿으면
-                    # 글씨 추종 종료 -> 2초 직진
+                    # 글씨 추종 종료 -> 3초 직진
                     if (
                         text_y2
                         >= int(
@@ -985,11 +985,11 @@ def control_loop():
                         )
 
                         state_start_time = time.time()
-                        drive_state = "FORWARD_2SEC"
+                        drive_state = "FORWARD_3SEC"
 
                         print(
                             f"[YOLO] {text_target['type']} bbox bottom reached screen bottom "
-                            "-> forward 2.0s"
+                            "-> forward 3.0s"
                         )
 
                     else:
@@ -1034,7 +1034,7 @@ def control_loop():
                     drive_state = "STOP_3SEC"
 
                     print(
-                        "[TEXT] forward 2.0s done -> stop 3.0s"
+                        "[TEXT] forward 3.0s done -> stop 3.0s"
                     )
 
             # ================================================
