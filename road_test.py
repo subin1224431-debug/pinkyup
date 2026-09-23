@@ -54,7 +54,8 @@ CENTER_TOL = 30
 # ============================================================
 # ROI
 # ============================================================
-ROI_START_RATIO = 0.68
+# 화면 아래쪽 절반(50%)만 중심선/YOLO 인식 영역으로 사용
+ROI_START_RATIO = 0.50
 
 
 # ============================================================
@@ -312,7 +313,9 @@ def fill_road_internal_gaps(white_mask):
 # ============================================================
 # YOLO STOP / STATION 검출
 # ============================================================
-def detect_text_yolo(frame):
+def detect_text_yolo(frame, y_offset=0):
+    # YOLO는 전달된 ROI 이미지 안에서만 실행한다.
+    # y_offset은 ROI bbox 좌표를 전체 카메라 좌표로 복원할 때 사용한다.
     results = yolo_model(
         frame,
         imgsz=YOLO_IMGSZ,
@@ -351,18 +354,23 @@ def detect_text_yolo(frame):
             box.xyxy[0].tolist()
         )
 
+        # YOLO는 ROI 내부 좌표를 반환하므로
+        # 화면 표시/거리 판단을 위해 전체 프레임 y좌표로 복원한다.
+        y1_full = y1 + y_offset
+        y2_full = y2 + y_offset
+
         candidates.append({
             "type": name,
             "conf": conf,
             "bbox": (
                 x1,
-                y1,
+                y1_full,
                 x2,
-                y2
+                y2_full
             ),
             "center": (
                 (x1 + x2) // 2,
-                (y1 + y2) // 2
+                (y1_full + y2_full) // 2
             )
         })
 
@@ -638,7 +646,8 @@ def control_loop():
         ):
             try:
                 text_target = detect_text_yolo(
-                    frame
+                    roi,
+                    y_offset=roi_start
                 )
             except Exception as e:
                 print(
