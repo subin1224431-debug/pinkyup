@@ -121,7 +121,7 @@ TEXT_BOTTOM_TURN_SEC = 0.6
 TEXT_BOTTOM_TRIGGER_RATIO = 0.98
 
 # 글씨가 화면 아래까지 도달한 뒤 동작
-FORWARD_AFTER_TEXT_SEC = 2.0
+FORWARD_AFTER_TEXT_SEC = 3.0
 STOP_AFTER_TEXT_SEC = 3.0
 
 text_full_count = 0
@@ -1003,7 +1003,7 @@ def control_loop():
 
                             print(
                                 "[YOLO] STOP bbox bottom reached screen bottom "
-                                "-> forward 2.0s"
+                                "-> forward 3.0s"
                             )
 
                     else:
@@ -1051,7 +1051,7 @@ def control_loop():
                     drive_state = "FORWARD_2SEC"
 
                     print(
-                        "[TEXT] right turn 0.6s done -> forward 2.0s"
+                        "[TEXT] right turn 0.6s done -> forward 3.0s"
                     )
 
             # ================================================
@@ -1075,7 +1075,7 @@ def control_loop():
                     drive_state = "STOP_3SEC"
 
                     print(
-                        "[TEXT] forward 2.0s done -> stop 3.0s"
+                        "[TEXT] forward 3.0s done -> stop 3.0s"
                     )
 
             # ================================================
