@@ -254,7 +254,7 @@ second_reference_acquired = False
 def wait_for_signals():
     global auto_mode, state, auto_start_time
     
-    LAPTOP_IP = "192.168.4.20"
+    LAPTOP_IP = "192.168.4.10"
     PORT = 6000
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
