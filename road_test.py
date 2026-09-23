@@ -73,14 +73,28 @@ IR_THRESHOLD = 2600
 # IR 카운트가 한 번 증가하면 2초 동안 추가 카운트 금지
 IR_COUNT_COOLDOWN_SEC = 2.0
 
-# 카운트 5가 된 순간부터 6초 동안 추가 IR 카운팅 금지
-COUNT5_RECOUNT_LOCK_SEC = 6.0
+# 카운트 5가 된 순간부터 4초 동안 추가 IR 카운팅 금지
+COUNT5_RECOUNT_LOCK_SEC = 4.0
 
 # 카운트 6이 된 순간부터 5초 동안 추가 IR 카운팅 금지
 COUNT6_RECOUNT_LOCK_SEC = 5.0
 
 # AUTO 시작 직후 1초 동안은 목표/IR을 무시하고 직진만 한다.
 START_STRAIGHT_ONLY_SEC = 1.0
+
+# IR 카운팅은 실제로 다음 노드를 향해 주행하는 상태에서만 허용한다.
+# 회전/탐색/정렬/후진 중에는 같은 노드를 다시 밟아도 카운트하지 않는다.
+# 특히 COUNT 1 직후 FIRST_BLOB_STRAIGHT에서는 같은 첫 화살표 재카운팅을 막기 위해
+# 카운팅을 금지하고, 다음 화살표를 확보해 FOLLOW로 복귀한 뒤 다시 허용한다.
+COUNT_ALLOWED_STATES = {
+    "START",
+    "FOLLOW",
+    # COUNT 1 직후 FIRST_BLOB_STRAIGHT에서는 재카운팅 금지.
+    # 첫 번째 화살표를 완전히 벗어나고 다음 화살표를 확보해
+    # FOLLOW로 복귀한 뒤부터 COUNT 2 카운팅을 다시 허용한다.
+    "SECOND_COUNT_DISTANCE_DRIVE",
+    "IR_CONTINUE",
+}
 
 # Camera ROI: 아래 50%
 # 기존에는 좌우 각각 10%를 제외했지만,
@@ -141,7 +155,7 @@ COUNT6_FINAL_STOP_SEC = 3.0
 # 값이 작을수록 화살표가 멀리 있을 때 일찍 우회전하고,
 # 값이 클수록 화살표에 더 가까이 간 뒤 늦게 우회전한다.
 # 예: 0.55 -> 일찍, 0.65 -> 중간, 0.75 -> 늦게
-SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.27
+SECOND_COUNT_FORWARD_TRIGGER_RATIO = 0.26
 
 # 카운트 2를 밟은 직후 화면 아래에 남아 있는 "방금 밟은 화살표"와
 # 앞쪽의 다음 화살표를 구분하기 위한 점프 기준. ROI 높이의 이 비율 이상
@@ -1234,9 +1248,12 @@ def control_loop():
         # ----------------------------------------------------
         # GLOBAL IR COUNT
         #
-        # AUTO 시작 후 첫 1초만 제외하고,
-        # 이후에는 어떤 state에 있든 IR이 새 검은 표식을 밟으면
-        # 무조건 딱 1회 카운트한다.
+        # AUTO 시작 후 첫 1초를 제외하고,
+        # 실제 다음 노드로 주행하는 COUNT_ALLOWED_STATES에서만
+        # IR 카운팅을 허용한다.
+        #
+        # SEARCH / ALIGN / TURN / REVERSE 상태에서는
+        # 같은 노드를 다시 밟아도 카운트하지 않는다.
         #
         # 같은 표식 중복 카운트는 ir_armed=False로 잠그고,
         # 흰 바닥을 IR_CLEAR_FRAMES 연속 확인한 뒤에만 재활성화한다.
@@ -1247,6 +1264,7 @@ def control_loop():
         if (
             auto_mode
             and (now - auto_start_time) >= START_STRAIGHT_ONLY_SEC
+            and state in COUNT_ALLOWED_STATES
             and ir_armed
             and ir_hit
             and now >= count5_recount_lock_until
@@ -1755,14 +1773,14 @@ def control_loop():
             # ====================================================
             # COUNT 6 SPECIAL
             # 6번째 IR에서만 실행:
-            # 정지 1초 -> 우회전 0.3초 -> 정지 1초 -> 후진 2초 -> 정지 3초
+            # 정지 1초 -> 우회전 0.6초 -> 정지 1초 -> 후진 2초 -> 정지 3초
             # ====================================================
             elif state == "COUNT6_PRE_STOP":
                 stop_robot()
                 if time.time() - count6_phase_time >= COUNT6_PRE_STOP_SEC:
                     count6_phase_time = time.time()
                     state = "COUNT6_TURN"
-                    print("[COUNT 6] pre stop done -> turn 0.3s")
+                    print("[COUNT 6] pre stop done -> turn 0.6s")
 
             elif state == "COUNT6_TURN":
                 if time.time() - count6_phase_time < COUNT6_TURN_SEC:
@@ -2100,6 +2118,16 @@ def control_loop():
             (12,134),
             cv2.FONT_HERSHEY_SIMPLEX,
             .48,
+            (0,255,255),
+            2
+        )
+
+        cv2.putText(
+            vis,
+            f"IR_COUNT_ALLOWED: {state in COUNT_ALLOWED_STATES}",
+            (12,160),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .46,
             (0,255,255),
             2
         )
