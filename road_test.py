@@ -47,7 +47,7 @@ TEXT_FOLLOW_SPEED = 16
 TEXT_FOLLOW_KP = 0.10
 TEXT_FOLLOW_MAX_CORR = 10
 
-TURN_SPEED = 24
+TURN_SPEED = 22
 ALIGN_SPEED = 8
 CENTER_TOL = 30
 
@@ -87,7 +87,7 @@ INTERNAL_GAP_RATIO = 0.30
 # ============================================================
 # 시작 후 25초 동안 중심선 추종
 # ============================================================
-CENTERLINE_RUN_SEC = 25.0
+CENTERLINE_RUN_SEC = 26.0
 auto_start_time = None
 initial_25s_done = False
 
@@ -705,7 +705,7 @@ def control_loop():
                         text_candidate_type = None
 
                         print(
-                            "[TIMER] first 25s centerline done -> SEARCH_TEXT"
+                            "[TIMER] first 26s centerline done -> SEARCH_TEXT"
                         )
 
                     elif error is not None:
@@ -1369,7 +1369,7 @@ def command(key):
 
             if not initial_25s_done:
                 auto_start_time = time.time()
-                print("AUTO ON -> FIRST 25s CENTERLINE")
+                print("AUTO ON -> FIRST 26s CENTERLINE")
             else:
                 print("AUTO ON -> NORMAL CENTERLINE")
         else:
