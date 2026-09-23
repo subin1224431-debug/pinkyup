@@ -91,6 +91,49 @@ CENTERLINE_RUN_SEC = 25.0
 auto_start_time = None
 initial_25s_done = False
 
+# ============================================================
+# 시간 기반 가상좌표
+#
+# 출발점을 (0, 0)으로 두고,
+# 명령한 좌/우 모터 속도를 이용해 대략적인 이동량/방향을 누적한다.
+# 엔코더/GPS가 없기 때문에 실제 m 좌표가 아니라 '가상 단위'이다.
+# 실험하면서 VIRTUAL_SPEED_SCALE 값을 보정해서 사용할 수 있다.
+# ============================================================
+virtual_x = 0.0
+virtual_y = 0.0
+virtual_theta = 0.0
+
+# 속도 명령 100일 때 1초 동안 이동하는 가상 거리
+# 실제 거리와 맞추려면 실험으로 보정
+VIRTUAL_SPEED_SCALE = 0.010
+
+# 좌우 속도 차이에 따른 회전각 누적 계수
+# 실제 회전량과 맞추려면 실험으로 보정
+VIRTUAL_TURN_SCALE = 0.020
+
+virtual_last_time = time.time()
+last_cmd_left = 0.0
+last_cmd_right = 0.0
+
+# ============================================================
+# STATION 가상좌표 트리거 설정
+#
+# 아직 실제 STATION 좌표를 측정하지 않았으므로 아래 값은 비활성 상태.
+# 실제 코스에서 원하는 STATION 위치의 VIRTUAL X / Y / TH 값을 확인한 뒤
+# STATION_COORD_ENABLED = True 로 바꾸고 목표값을 넣으면 된다.
+# ============================================================
+STATION_COORD_ENABLED = False
+
+STATION_TARGET_X = 0.0
+STATION_TARGET_Y = 0.0
+STATION_TARGET_TH_DEG = 0.0
+
+STATION_X_TOL = 0.25
+STATION_Y_TOL = 0.25
+STATION_TH_TOL_DEG = 15.0
+
+station_coord_triggered = False
+
 
 # ============================================================
 # YOLO STOP / STATION
@@ -214,13 +257,28 @@ def clamp(v, lo=-100, hi=100):
 
 
 def drive(left, right):
+    global last_cmd_left
+    global last_cmd_right
+
+    left_c = clamp(left)
+    right_c = clamp(right)
+
+    last_cmd_left = float(left_c)
+    last_cmd_right = float(right_c)
+
     motor.move(
-        clamp(left),
-        clamp(right)
+        left_c,
+        right_c
     )
 
 
 def stop_robot():
+    global last_cmd_left
+    global last_cmd_right
+
+    last_cmd_left = 0.0
+    last_cmd_right = 0.0
+
     motor.move(0, 0)
 
 
@@ -399,6 +457,19 @@ def detect_text_yolo(frame, y_offset=0):
     )
 
 
+def station_virtual_coordinate_reached():
+    if not STATION_COORD_ENABLED:
+        return False
+
+    th_deg = np.degrees(virtual_theta)
+
+    return (
+        abs(virtual_x - STATION_TARGET_X) <= STATION_X_TOL
+        and abs(virtual_y - STATION_TARGET_Y) <= STATION_Y_TOL
+        and abs(th_deg - STATION_TARGET_TH_DEG) <= STATION_TH_TOL_DEG
+    )
+
+
 # ============================================================
 # Main control loop
 # ============================================================
@@ -418,6 +489,13 @@ def control_loop():
     global auto_start_time
     global initial_25s_done
 
+    global virtual_x
+    global virtual_y
+    global virtual_theta
+    global virtual_last_time
+    global station_coord_triggered
+    global current_text_type
+
     while not stop_event.is_set():
 
         frame = camera.get_frame()
@@ -429,6 +507,49 @@ def control_loop():
         frame = frame.copy()
 
         h, w = frame.shape[:2]
+
+        # ----------------------------------------------------
+        # 시간 기반 가상좌표 업데이트
+        #
+        # 출발점 = (0, 0)
+        # theta = 0 rad는 시작 당시 로봇 정면 방향
+        # ----------------------------------------------------
+        now_virtual = time.time()
+        dt_virtual = now_virtual - virtual_last_time
+        virtual_last_time = now_virtual
+
+        if dt_virtual > 0.0:
+            avg_cmd = (
+                last_cmd_left
+                + last_cmd_right
+            ) / 2.0
+
+            turn_cmd = (
+                last_cmd_right
+                - last_cmd_left
+            )
+
+            virtual_theta += (
+                turn_cmd
+                * VIRTUAL_TURN_SCALE
+                * dt_virtual
+            )
+
+            virtual_distance = (
+                avg_cmd
+                * VIRTUAL_SPEED_SCALE
+                * dt_virtual
+            )
+
+            virtual_x += (
+                virtual_distance
+                * np.cos(virtual_theta)
+            )
+
+            virtual_y += (
+                virtual_distance
+                * np.sin(virtual_theta)
+            )
 
         # ----------------------------------------------------
         # ROI
@@ -773,19 +894,31 @@ def control_loop():
 
                 # ------------------------------------------------
                 # 최초 25초 과정이 끝난 뒤:
-                # 평소에는 중심선 추종.
-                # 다음 STOP/STATION 글씨가 보이면 그때부터는
-                # 도로 중심선이 아니라 글씨 중심점을 기준으로 접근.
+                #
+                # STOP 이벤트가 끝난 뒤부터는 다시 도로 중심선 추종.
+                # STATION은 YOLO를 보고 바로 꺾지 않고,
+                # 설정된 가상좌표에 도달할 때까지 중심선 추종을 유지한다.
                 # ------------------------------------------------
                 else:
 
-                    if text_target is not None:
-                        current_text_type = text_target["type"]
-                        drive_state = "APPROACH_TEXT"
+                    if (
+                        STATION_COORD_ENABLED
+                        and not station_coord_triggered
+                        and station_virtual_coordinate_reached()
+                    ):
+                        station_coord_triggered = True
+                        current_text_type = "STATION"
+
+                        # STATION 가상좌표에 도달하면 여기서 STATION 전용 동작 시작.
+                        # 기존에 정한 STATION 동작:
+                        # 1초 추가 직진 -> 오른쪽 0.6초 제자리 회전
+                        # -> 2초 직진 -> 3초 정지 -> 중심선 추종
+                        state_start_time = time.time()
+                        drive_state = "STATION_PRE_TURN_FORWARD"
 
                         print(
-                            f"[YOLO] next {text_target['type']} detected "
-                            "-> APPROACH_TEXT"
+                            "[VIRTUAL] STATION coordinate reached "
+                            "-> STATION_PRE_TURN_FORWARD"
                         )
 
                     elif error is not None:
@@ -864,7 +997,17 @@ def control_loop():
                         text_target["type"]
                     )
 
-                    if text_fully_inside:
+                    # 최초 25초 후 SEARCH_TEXT에서는 STOP만 처리한다.
+                    # STATION은 이후 가상좌표로 처리한다.
+                    if current_type != "STOP":
+                        text_full_count = 0
+                        text_candidate_type = None
+                        full_text_target = None
+                        continue_search = True
+                    else:
+                        continue_search = False
+
+                    if (not continue_search) and text_fully_inside:
                         if (
                             text_candidate_type
                             == current_type
@@ -1102,9 +1245,9 @@ def control_loop():
             elif drive_state == "FORWARD_2SEC":
 
                 if current_text_type == "STATION":
-                    forward_duration = STATION_FORWARD_AFTER_TURN_SEC
+                    forward_duration = 2.0
                 else:
-                    forward_duration = FORWARD_AFTER_TEXT_SEC
+                    forward_duration = 3.0
 
                 if (
                     time.time()
@@ -1138,6 +1281,7 @@ def control_loop():
                     - state_start_time
                     >= STOP_AFTER_TEXT_SEC
                 ):
+                    current_text_type = None
                     current_text_type = None
                     drive_state = "CENTERLINE"
 
@@ -1257,6 +1401,52 @@ def control_loop():
                 (255, 255, 0),
                 2
             )
+
+        # ----------------------------------------------------
+        # YOLO 좌표 고정 HUD
+        #
+        # 좌표 기준:
+        # (0, 0) = 전체 카메라 화면의 왼쪽 위
+        # x는 오른쪽으로 증가
+        # y는 아래쪽으로 증가
+        #
+        # YOLO는 아래 50% ROI에서 실행하지만,
+        # y_offset을 더해 전체 화면 기준 Y좌표로 표시한다.
+        # ----------------------------------------------------
+        if text_target is not None:
+            tx1, ty1, tx2, ty2 = text_target["bbox"]
+            tcx = (tx1 + tx2) // 2
+
+            cv2.putText(
+                result,
+                f"YOLO {text_target['type']}  CX:{tcx}  Y2:{ty2}",
+                (12, 135),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 255, 255),
+                2
+            )
+        else:
+            cv2.putText(
+                result,
+                "YOLO: NOT DETECTED",
+                (12, 135),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 255, 255),
+                2
+            )
+
+        # 가상좌표 HUD
+        cv2.putText(
+            result,
+            f"VIRTUAL X:{virtual_x:.2f}  Y:{virtual_y:.2f}  TH:{np.degrees(virtual_theta):.1f}",
+            (12, 162),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2
+        )
 
         shown_state = (
             drive_state
@@ -1464,6 +1654,13 @@ def command(key):
     global last_error
     global state_start_time
 
+    global virtual_x
+    global virtual_y
+    global virtual_theta
+    global virtual_last_time
+    global station_coord_triggered
+    global current_text_type
+
     if key == "p":
         auto_mode = not auto_mode
 
@@ -1488,6 +1685,15 @@ def command(key):
 
         auto_start_time = None
         initial_25s_done = False
+
+        # 가상좌표도 출발점으로 초기화
+        virtual_x = 0.0
+        virtual_y = 0.0
+        virtual_theta = 0.0
+        virtual_last_time = time.time()
+
+        station_coord_triggered = False
+        current_text_type = None
 
         text_full_count = 0
         text_candidate_type = None
