@@ -54,7 +54,7 @@ CENTER_TOL = 30
 # ============================================================
 # ROI
 # ============================================================
-ROI_START_RATIO = 0.68
+ROI_START_RATIO = 0.60
 
 
 # ============================================================
@@ -111,6 +111,8 @@ third_arrow_trigger_count = 0
 MODEL_PATH = "best_ncnn_model"
 YOLO_CONF = 0.45
 YOLO_IMGSZ = 320
+YOLO_INTERVAL = 5
+frame_counter = 0
 TEXT_CLASSES = {"STOP", "STATION"}
 
 TEXT_FULL_MARGIN = 35
@@ -465,8 +467,10 @@ def control_loop():
 
     global text_full_count
     global text_candidate_type
+    global frame_counter
     while not stop_event.is_set():
 
+        frame_counter += 1
         frame = camera.get_frame()
 
         if frame is None:
@@ -782,7 +786,7 @@ def control_loop():
         # 첫 번째 3번째 화살표 이후부터는
         # 중심선 주행 중에도 다음 STOP/STATION을 계속 찾는다.
         # ----------------------------------------------------
-        text_target = None
+        text_target = getattr(control_loop, "last_text_target", None)
 
         if (
             arrow_count >= 3
@@ -794,9 +798,9 @@ def control_loop():
             )
         ):
             try:
-                text_target = detect_text_yolo(
-                    frame
-                )
+                if frame_counter % YOLO_INTERVAL == 0:
+                    text_target = detect_text_yolo(frame)
+                    control_loop.last_text_target = text_target
             except Exception as e:
                 print(
                     "YOLO ERROR:",
@@ -1377,6 +1381,7 @@ def command(key):
 
     global text_full_count
     global text_candidate_type
+    global frame_counter
     global last_error
     global state_start_time
 
