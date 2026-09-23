@@ -7,6 +7,8 @@ from flask import Flask, Response, render_template_string
 from pinkylib import Camera, Motor, IR
 from ultralytics import YOLO
 import os
+import zmq
+import json
 
 # ============================================================
 # Pinky Pro - 화살표 Blob 중심(OpenCV) + STOP/STATION(YOLO) 통합 주행
@@ -270,6 +272,33 @@ COUNT7_ARROW_FULL_MARGIN = 20
 second_forward_trigger_count = 0
 second_ir_arrow_bottom = None
 second_reference_acquired = False
+
+
+# ============================================================
+# ZMQ 통신 클라이언트 대기 스레드
+# ============================================================
+def zmq_wait_for_start():
+    global auto_mode, state, auto_start_time
+
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.connect("tcp://192.168.4.20:6000")  # 노트북의 와이파이 IP
+
+    print("[핑키봇] 노트북(서버)에 접속 및 대기 해제 신호를 보냅니다...")
+    socket.send_string("핑키봇 준비 완료!")
+
+    # 노트북에서 넘겨주는 START_AUTONAV 신호를 받을 때까지 대기
+    response_raw = socket.recv_string()
+    response = json.loads(response_raw)
+
+    if response.get("status") == "START_AUTONAV":
+        print("[핑키봇] 노트북으로부터 주행 시작 명령을 받았습니다. 주행을 시작합니다!")
+
+        # 웹의 'p' 키를 눌렀을 때와 동일하게 AUTO 시작
+        auto_mode = True
+        auto_start_time = time.time()
+        state = "START"
+
 
 # ============================================================
 # Motor helpers
@@ -1231,18 +1260,25 @@ def control_loop():
 
         # ----------------------------------------------------
         # IR 재활성화 로직
-        # 한 번 검은 표식에서 멈춘 직후에는 IR을 잠시 무시한다.
-        # 로봇이 그 검은 표식에서 완전히 벗어나 센서가 연속 몇 프레임
-        # "흰 바닥"을 본 뒤에만 다시 IR 감지를 활성화한다.
+        #
+        # 회전 / 탐색 / 정렬 / 후진 중에는 ir_armed를 다시 켜지 않는다.
+        # 실제로 다음 노드를 향해 주행하는 COUNT_ALLOWED_STATES에 들어온 뒤,
+        # IR 3개가 모두 흰 바닥을 연속 IR_CLEAR_FRAMES 동안 확인해야
+        # 그때부터 다음 카운팅을 허용한다.
         # ----------------------------------------------------
         if not ir_armed:
-            if not ir_hit:
-                ir_clear_count += 1
-            else:
-                ir_clear_count = 0
+            if state in COUNT_ALLOWED_STATES:
+                if not ir_hit:
+                    ir_clear_count += 1
+                else:
+                    ir_clear_count = 0
 
-            if ir_clear_count >= IR_CLEAR_FRAMES:
-                ir_armed = True
+                if ir_clear_count >= IR_CLEAR_FRAMES:
+                    ir_armed = True
+                    ir_clear_count = 0
+                    print(f"[IR REARM] enabled in state={state}")
+            else:
+                # 회전/정렬/후진/탐색 중에는 재활성화 진행 자체를 막는다.
                 ir_clear_count = 0
 
         # ----------------------------------------------------
@@ -2324,6 +2360,12 @@ def command(key):
 if __name__ == "__main__":
     threading.Thread(
         target=control_loop,
+        daemon=True
+    ).start()
+
+    # 노트북에서 보내는 시작 신호 대기 스레드 실행
+    threading.Thread(
+        target=zmq_wait_for_start,
         daemon=True
     ).start()
 
