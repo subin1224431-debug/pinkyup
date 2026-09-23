@@ -158,7 +158,6 @@ auto_mode = False
 
 last_error = 0
 state_start_time = 0.0
-mission_completed = False
 
 
 # =========================================================
@@ -703,8 +702,7 @@ while True:
     )
 
     if (
-        not mission_completed
-        and arrow_count < 3
+        arrow_count < 3
         and drive_state == "CENTERLINE"
     ):
 
@@ -744,8 +742,7 @@ while True:
     # 그 화살표 bbox 아래쪽 끝이 기준선까지 내려오면 우회전.
     # =====================================================
     if (
-        not mission_completed
-        and drive_state == "CENTERLINE"
+        drive_state == "CENTERLINE"
         and arrow_count == 3
         and arrow_target is not None
     ):
@@ -790,10 +787,14 @@ while True:
     # =====================================================
     text_target = None
 
-    if drive_state in (
-        "SEARCH_TEXT",
-        "ALIGN_TEXT",
-        "DRIVE_TEXT"
+    if (
+        arrow_count >= 3
+        and drive_state in (
+            "CENTERLINE",
+            "SEARCH_TEXT",
+            "ALIGN_TEXT",
+            "DRIVE_TEXT"
+        )
     ):
         try:
             text_target = detect_text_yolo(
@@ -830,7 +831,24 @@ while True:
         # -------------------------------------------------
         if drive_state == "CENTERLINE":
 
-            if error is not None:
+            # 첫 3번째 화살표 특수 진입이 끝난 뒤에는
+            # 중심선 추종 중 다음 STOP/STATION이 YOLO로 다시 보이면
+            # 새로운 IR 1회 사이클을 시작한다.
+            if (
+                arrow_count >= 3
+                and text_target is not None
+                and not yolo_ir_waiting
+                and not yolo_ir_consumed
+            ):
+                stop()
+                yolo_ir_waiting = True
+                drive_state = "ALIGN_TEXT"
+
+                print(
+                    f"[YOLO] next {text_target['type']} detected during CENTERLINE -> ALIGN_TEXT / wait next IR"
+                )
+
+            elif error is not None:
                 correction = (
                     KP * error
                 )
@@ -1066,7 +1084,7 @@ while True:
 
         # -------------------------------------------------
         # STOP_3SEC
-        # 3초 정지 후 완전히 기존 중심선 추종으로 복귀
+        # 3초 정지 후 중심선 추종으로 복귀하고 다음 YOLO를 다시 기다림
         # -------------------------------------------------
         elif drive_state == "STOP_3SEC":
 
@@ -1077,11 +1095,16 @@ while True:
                 - state_start_time
                 >= IR_STOP_SEC
             ):
-                mission_completed = True
+                # 이번 YOLO -> IR 1회 사이클 완료.
+                # 다음 YOLO 글씨를 다시 인식했을 때
+                # 새로운 IR 1회를 기다릴 수 있도록 초기화한다.
+                yolo_ir_waiting = False
+                yolo_ir_consumed = False
+
                 drive_state = "CENTERLINE"
 
                 print(
-                    "[IR] 3s stop done -> CENTERLINE"
+                    "[IR] 3s stop done -> CENTERLINE / ready for next YOLO"
                 )
 
 
@@ -1154,10 +1177,7 @@ while True:
 
 
     # 카메라 화살표 bbox
-    if (
-        arrow_target is not None
-        and not mission_completed
-    ):
+    if arrow_target is not None:
         ax, ay, aw, ah = arrow_target["bbox"]
 
         cv2.rectangle(
@@ -1178,7 +1198,6 @@ while True:
     # 3번째 화살표가 잡힌 뒤 거리 기준선 표시
     if (
         arrow_count == 3
-        and not mission_completed
         and drive_state == "CENTERLINE"
     ):
         third_line_y = (
@@ -1429,7 +1448,6 @@ while True:
         text_candidate_type = None
 
         state_start_time = 0.0
-        mission_completed = False
 
         yolo_ir_waiting = False
         yolo_ir_consumed = False
