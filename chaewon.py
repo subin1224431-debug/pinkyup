@@ -87,7 +87,6 @@ INTERNAL_GAP_RATIO = 0.30
 # ============================================================
 # 카메라 화살표 카운팅
 #
-# IR은 화살표 카운팅에 사용하지 않는다.
 # 카메라에서 새 화살표를 발견할 때 1,2,3까지만 센다.
 # ============================================================
 ARROW_MIN_AREA = 350
@@ -103,8 +102,6 @@ arrow_count_armed = True
 # ============================================================
 # 3번째 화살표 거리 기준
 # ============================================================
-THIRD_ARROW_TRIGGER_RATIO = 0.15
-THIRD_ARROW_TRIGGER_FRAMES = 2
 third_arrow_trigger_count = 0
 
 
@@ -134,17 +131,10 @@ print("YOLO classes:", yolo_model.names)
 
 
 # ============================================================
-# IR
 #
 # 핵심:
-# 평소 IR은 전부 무시.
 # YOLO가 STOP/STATION을 인식한 뒤에만
-# '다음 처음 들어오는 IR 1회'만 사용.
 # ============================================================
-IR_THRESHOLD = 2600
-
-IR_REVERSE_SEC = 2.0
-IR_STOP_SEC = 3.0
 
 
 # ============================================================
@@ -763,7 +753,6 @@ def control_loop():
 
             trigger_y = int(
                 roi_h
-                * THIRD_ARROW_TRIGGER_RATIO
             )
 
             if arrow_bottom >= trigger_y:
@@ -773,7 +762,6 @@ def control_loop():
 
             if (
                 third_arrow_trigger_count
-                >= THIRD_ARROW_TRIGGER_FRAMES
             ):
                 stop_robot()
 
@@ -815,13 +803,6 @@ def control_loop():
                     e
                 )
 
-        # ----------------------------------------------------
-        # IR
-        #
-        # 항상 센서값은 읽지만,
-        # 실제 동작 트리거로 쓰는 것은
-        # yolo_ir_waiting=True 상태의 다음 IR 1회뿐.
-        # ----------------------------------------------------
 
         # ----------------------------------------------------
         # Manual override
@@ -844,7 +825,6 @@ def control_loop():
 
                 # 3번째 화살표 이후에는
                 # 중심선 추종 중 다음 STOP/STATION이 다시 보이면
-                # 새 YOLO -> IR 1회 사이클 시작
                 if (
                     arrow_count >= 3
                     and text_target is not None
@@ -855,7 +835,6 @@ def control_loop():
 
                     print(
                         f"[YOLO] next {text_target['type']} detected "
-                        "-> ALIGN_TEXT / wait next IR"
                     )
 
                 elif error is not None:
@@ -961,13 +940,11 @@ def control_loop():
                 if full_text_target is not None:
                     stop_robot()
 
-                    if not yolo_ir_consumed:
-
                     drive_state = "ALIGN_TEXT"
 
                     print(
                         f"[YOLO] {full_text_target['type']} "
-                        "full -> ALIGN_TEXT / IR waiting"
+                        "full -> ALIGN_TEXT"
                     )
 
                 else:
@@ -1020,24 +997,7 @@ def control_loop():
             # ================================================
             elif drive_state == "DRIVE_TEXT":
 
-                # YOLO 이후 다음 IR 1회만 사용
-                if (
-                    yolo_ir_waiting
-                    and not yolo_ir_consumed
-                    and ir_hit
-                ):
 
-                    drive(
-                        -BASE_SPEED,
-                        -BASE_SPEED
-                    )
-
-                    state_start_time = time.time()
-                    drive_state = "REVERSE_IR"
-
-                    print(
-                        "[IR] FIRST IR after YOLO -> reverse 2.0s"
-                    )
 
                 elif text_target is not None:
                     text_x = (
@@ -1063,36 +1023,11 @@ def control_loop():
 
                 else:
                     # 글씨가 아래로 빠진 후에도
-                    # 다음 IR 1회까지 직진
                     drive(
                         TEXT_FOLLOW_SPEED,
                         TEXT_FOLLOW_SPEED
                     )
 
-            # ================================================
-            # REVERSE_IR
-            # ================================================
-            elif drive_state == "REVERSE_IR":
-
-                if (
-                    time.time()
-                    - state_start_time
-                    < IR_REVERSE_SEC
-                ):
-                    drive(
-                        -BASE_SPEED,
-                        -BASE_SPEED
-                    )
-
-                else:
-                    stop_robot()
-
-                    state_start_time = time.time()
-                    drive_state = "STOP_3SEC"
-
-                    print(
-                        "[IR] reverse done -> stop 3.0s"
-                    )
 
             # ================================================
             # STOP_3SEC
@@ -1104,15 +1039,12 @@ def control_loop():
                 if (
                     time.time()
                     - state_start_time
-                    >= IR_STOP_SEC
                 ):
                     # 다음 YOLO 글씨가 나왔을 때
-                    # 다시 다음 IR 1회를 사용할 수 있도록 초기화
 
                     drive_state = "CENTERLINE"
 
                     print(
-                        "[IR] 3s stop done -> CENTERLINE / "
                         "ready for next YOLO"
                     )
 
@@ -1196,7 +1128,6 @@ def control_loop():
                 roi_start
                 + int(
                     roi_h
-                    * THIRD_ARROW_TRIGGER_RATIO
                 )
             )
 
@@ -1210,7 +1141,6 @@ def control_loop():
 
             cv2.putText(
                 result,
-                f"ARROW3 DIST LINE {THIRD_ARROW_TRIGGER_RATIO:.2f}",
                 (
                     10,
                     max(
@@ -1357,7 +1287,6 @@ button{
 </head>
 <body>
 
-<h2>Pinky Centerline + YOLO -> One IR</h2>
 
 <img src="/video_feed">
 
