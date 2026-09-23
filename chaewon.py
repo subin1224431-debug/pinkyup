@@ -38,7 +38,7 @@ STATION_HOLD = 3.0
 ARROW_TRIGGER_RATIO = 0.78
 TURN_TIME = 1.0
 
-MODEL_PATH = "best.pt"
+MODEL_PATH = "best_ncnn_model"
 
 
 # =========================
@@ -50,7 +50,7 @@ motor = Motor()
 camera.start()
 motor.enable_motor()
 
-model = YOLO(MODEL_PATH)
+model = YOLO(MODEL_PATH)  # YOLO NCNN 모델 (best_ncnn_model)
 
 
 # =========================
