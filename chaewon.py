@@ -1037,6 +1037,7 @@ def control_loop():
     global manual_until, manual_cmd
     global ir_armed, ir_clear_count, last_ir_count_time
     global count5_recount_lock_until, count6_recount_lock_until
+    global ir_event_lock_until
     global lost_count, last_target
     global ir_armed, ir_clear_count, last_ir_count_time
     global yolo_model
@@ -2321,8 +2322,8 @@ def command(key):
         ir_clear_count = 0
         last_ir_count_time = -999.0
 
-# IR 카운트 직후 일시 잠금 시간
-ir_event_lock_until = 0.0
+        # IR 카운트 직후 일시 잠금 시간
+        ir_event_lock_until = 0.0
         count5_recount_lock_until = 0.0
         count6_recount_lock_until = 0.0
         stop_robot()
