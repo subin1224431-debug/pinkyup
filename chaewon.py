@@ -4,7 +4,7 @@ import time
 import threading
 from collections import deque
 from flask import Flask, Response, render_template_string
-from pinkylib import Camera, Motor, IR
+from pinkylib import Camera, Motor
 from ultralytics import YOLO
 import os
 import zmq
@@ -18,7 +18,7 @@ import json
 # 2) 화살표는 OpenCV, STOP/STATION은 YOLO로 검출 -> 화면 중앙 정렬
 # 3) 갈라진 검은 조각을 그룹화한 뒤 solid Blob으로 뭉개고 무게중심 추종
 #    STOP/STATION: YOLO bbox 중심 추종
-# 4) IR 센서가 검은색 감지 -> 정지
+# 4) YOLO bbox 기반 STOP/STATION 정렬 및 정지
 # 5) 다음 목표가 안 보이면 오른쪽 제자리 회전하며 탐색
 # 6) 목표 발견 -> 중앙 정렬 -> 다시 직진/추종
 # ============================================================
@@ -30,7 +30,6 @@ app = Flask(__name__)
 # ----------------------------
 motor = Motor()
 camera = Camera()
-ir = IR()
 
 motor.enable_motor()
 camera.start()
@@ -149,7 +148,7 @@ COUNT6_FINAL_STOP_SEC = 3.0
 # ------------------------------------------------------------
 # 카운트 2 이후 거리 기반 직진 설정
 # ------------------------------------------------------------
-# 화살표 카운트는 이제 "화살표를 봤을 때"가 아니라 IR 센서가 실제로 밟았을 때만 증가한다.
+# 화살표 카운트는 카메라 solid blob 위치 기반으로 증가한다.
 #
 # 카운트 2가 된 뒤에는 바로 우회전하지 않고, 앞쪽에 보이는 다음 화살표를
 # 거리 기준점으로 사용해 조금 더 직진한다. 실제 거리센서가 아니므로 카메라 영상에서
@@ -276,6 +275,29 @@ COUNT7_ARROW_FULL_MARGIN = 20
 second_forward_trigger_count = 0
 second_ir_arrow_bottom = None
 second_reference_acquired = False
+
+
+
+# ============================================================
+# Camera based arrow trigger (NO IR)
+# 3번째 화살표:
+# solid blob bbox의 아래쪽 끝이 기준선에 도달하면 회전
+# ============================================================
+ARROW_TRIGGER_Y_RATIO = 0.78
+arrow_trigger_count = 0
+arrow_trigger_lock = False
+
+def arrow_reach_trigger(arrow_target, roi_height):
+    """
+    화살표 solid blob의 끝선이 기준선에 닿았는지 판단
+    """
+    if arrow_target is None:
+        return False
+
+    x, y, w, h = arrow_target["bbox"]
+    bottom = y + h
+
+    return bottom >= int(roi_height * ARROW_TRIGGER_Y_RATIO)
 
 # ============================================================
 # Motor helpers
@@ -1230,7 +1252,7 @@ def control_loop():
                 else:
                     target = None
 
-        ir_l, ir_c, ir_r = ir.read_ir()
+        ir_l, ir_c, ir_r = 0, 0, 0
 
         # ----------------------------------------------------
         # IR hit 판단
