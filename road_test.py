@@ -103,12 +103,11 @@ TEXT_CLASSES = {"STOP", "STATION"}
 TEXT_FULL_MARGIN = 35
 TEXT_FULL_STABLE_FRAMES = 3
 
-# YOLO 글씨를 찾은 뒤부터 60% 지점까지는 도로 중심선이 아니라
+# YOLO 글씨를 찾은 뒤부터는 도로 중심선 대신
 # 글씨의 중심점을 '가상 중심선'처럼 사용한다.
-# 글씨가 좌우로 치우쳐 있으면 제자리 회전으로 정면을 맞추고,
-# 글씨가 화면 중앙에 들어온 경우에만 천천히 전진한다.
-# 60% 지점에 도달했을 때도 중앙 정렬이 완료되어 있어야
-# DRIVE_TEXT로 넘어가 글씨 x 중심 기준으로 직진한다.
+# 제자리 회전하지 않고 P제어로 좌우 속도를 조절하면서 전진한다.
+# 글씨 bbox 아래쪽이 화면 높이의 60% 지점에 도달하면
+# DRIVE_TEXT로 상태만 전환하고 같은 방식으로 계속 접근한다.
 # 이 기준선은 화면에는 표시하지 않는다.
 TEXT_ALIGN_TRIGGER_RATIO = 0.60
 
@@ -640,7 +639,6 @@ def control_loop():
                 "CENTERLINE",
                 "SEARCH_TEXT",
                 "APPROACH_TEXT",
-                "ALIGN_TEXT",
                 "DRIVE_TEXT"
             )
         ):
@@ -888,22 +886,26 @@ def control_loop():
             # ================================================
             # APPROACH_TEXT
             #
-            # 글씨가 보인 뒤부터 60% 지점까지:
-            # 도로 중심선 대신 글씨 중심점을 기준으로 접근한다.
+            # YOLO 글씨를 인식한 뒤에는 제자리 회전하지 않는다.
+            # 글씨 중심 x좌표를 '가상 중심선'처럼 사용하여
+            # 중심선 추종과 비슷한 P제어 방식으로 전진하면서
+            # 부드럽게 글씨 방향으로 조향한다.
             #
-            # - 글씨 중심이 화면 중앙에서 벗어나면 제자리 회전
-            # - 중앙에 들어오면 천천히 직진
-            # - 60% 지점까지 이 과정을 반복해 글씨를 정면에 유지
-            # - 60% 지점 도달 시 중앙 정렬이 완료되어 있으면 DRIVE_TEXT
+            # 글씨 bbox 아래쪽이 화면 높이의 60% 지점까지 내려오면
+            # DRIVE_TEXT로 전환하지만, 주행 방식은 계속
+            # 글씨 x 중심 기준 P제어 전진이다.
             # ================================================
             elif drive_state == "APPROACH_TEXT":
 
                 if text_target is None:
-                    stop_robot()
-                    drive_state = "SEARCH_TEXT"
+                    # 글씨를 잠깐 놓치면 급회전하지 않고
+                    # 현재 방향으로 천천히 직진하며 다시 검출을 기다린다.
+                    drive(
+                        TEXT_FOLLOW_SPEED,
+                        TEXT_FOLLOW_SPEED
+                    )
 
                 else:
-
                     text_x = (
                         text_target["center"][0]
                     )
@@ -917,81 +919,33 @@ def control_loop():
                         - w // 2
                     )
 
-                    if abs(text_error) > CENTER_TOL:
-                        # 아직 글씨가 정면이 아니므로 전진하지 않고
-                        # 제자리에서 방향만 맞춘다.
-                        if text_error > 0:
-                            drive(
-                                ALIGN_SPEED,
-                                -ALIGN_SPEED
-                            )
-                        else:
-                            drive(
-                                -ALIGN_SPEED,
-                                ALIGN_SPEED
-                            )
-
-                    else:
-                        # 글씨 중심이 정면에 들어왔을 때만 접근
-                        if (
-                            text_y2
-                            < int(
-                                h * TEXT_ALIGN_TRIGGER_RATIO
-                            )
-                        ):
-                            drive(
-                                TEXT_FOLLOW_SPEED,
-                                TEXT_FOLLOW_SPEED
-                            )
-
-                        else:
-                            # 60% 지점까지 왔고 중심 정렬도 완료
-                            stop_robot()
-                            drive_state = "DRIVE_TEXT"
-
-                            print(
-                                f"[YOLO] {text_target['type']} "
-                                "front-centered at 60% -> DRIVE_TEXT"
-                            )
-
-            # ================================================
-            # ALIGN_TEXT
-            # ================================================
-            elif drive_state == "ALIGN_TEXT":
-
-                if text_target is None:
-                    drive_state = "SEARCH_TEXT"
-
-                else:
-                    text_x = (
-                        text_target["center"][0]
+                    # 글씨 중심을 기준으로 P제어하며 전진
+                    corr = np.clip(
+                        TEXT_FOLLOW_KP
+                        * text_error,
+                        -TEXT_FOLLOW_MAX_CORR,
+                        TEXT_FOLLOW_MAX_CORR
                     )
 
-                    text_error = (
-                        text_x
-                        - w // 2
+                    drive(
+                        TEXT_FOLLOW_SPEED + corr,
+                        TEXT_FOLLOW_SPEED - corr
                     )
 
-                    if abs(text_error) <= CENTER_TOL:
-                        stop_robot()
+                    # 충분히 가까워지면 DRIVE_TEXT로 상태만 전환.
+                    # 제자리 회전은 하지 않는다.
+                    if (
+                        text_y2
+                        >= int(
+                            h * TEXT_ALIGN_TRIGGER_RATIO
+                        )
+                    ):
                         drive_state = "DRIVE_TEXT"
 
                         print(
-                            f"[YOLO] {text_target['type']} "
-                            "centered -> DRIVE_TEXT"
+                            f"[YOLO] {text_target['type']} reached 60% "
+                            "-> DRIVE_TEXT"
                         )
-
-                    else:
-                        if text_error > 0:
-                            drive(
-                                ALIGN_SPEED,
-                                -ALIGN_SPEED
-                            )
-                        else:
-                            drive(
-                                -ALIGN_SPEED,
-                                ALIGN_SPEED
-                            )
 
             # ================================================
             # DRIVE_TEXT
