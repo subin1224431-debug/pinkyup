@@ -84,29 +84,12 @@ MAX_POINTS = 8
 
 INTERNAL_GAP_RATIO = 0.30
 
-
 # ============================================================
-# 카메라 화살표 카운팅
-#
-# IR은 화살표 카운팅에 사용하지 않는다.
-# 카메라에서 새 화살표를 발견할 때 1,2,3까지만 센다.
+# 시작 후 25초 동안 중심선 추종
 # ============================================================
-ARROW_MIN_AREA = 350
-ARROW_STABLE_FRAMES = 3
-ARROW_GONE_FRAMES = 8
-
-arrow_count = 0
-arrow_stable_count = 0
-arrow_missing_count = 0
-arrow_count_armed = True
-
-
-# ============================================================
-# 3번째 화살표 거리 기준
-# ============================================================
-THIRD_ARROW_TRIGGER_RATIO = 0.15
-THIRD_ARROW_TRIGGER_FRAMES = 2
-third_arrow_trigger_count = 0
+CENTERLINE_RUN_SEC = 25.0
+auto_start_time = None
+initial_25s_done = False
 
 
 # ============================================================
@@ -327,73 +310,6 @@ def fill_road_internal_gaps(white_mask):
 
 
 # ============================================================
-# 카메라 화살표 검출
-# ============================================================
-def detect_arrow_bbox(black_mask):
-    contours, _ = cv2.findContours(
-        black_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    candidates = []
-
-    h, w = black_mask.shape[:2]
-
-    for c in contours:
-        area = cv2.contourArea(c)
-
-        if area < ARROW_MIN_AREA:
-            continue
-
-        x, y, bw, bh = cv2.boundingRect(c)
-
-        if bw <= 0 or bh <= 0:
-            continue
-
-        aspect = bw / max(
-            bh,
-            1
-        )
-
-        # 너무 가로로 긴 글씨/선은 제외
-        if aspect > 2.8:
-            continue
-
-        if (
-            bw > int(w * 0.80)
-            or bh > int(h * 0.95)
-        ):
-            continue
-
-        candidates.append({
-            "bbox": (
-                x,
-                y,
-                bw,
-                bh
-            ),
-            "area": float(area),
-            "center": (
-                x + bw // 2,
-                y + bh // 2
-            )
-        })
-
-    if not candidates:
-        return None
-
-    return max(
-        candidates,
-        key=lambda z: (
-            z["bbox"][1]
-            + z["bbox"][3],
-            z["area"]
-        )
-    )
-
-
-# ============================================================
 # YOLO STOP / STATION 검출
 # ============================================================
 def detect_text_yolo(frame):
@@ -471,17 +387,13 @@ def control_loop():
     global manual_until
     global manual_cmd
 
-    global arrow_count
-    global arrow_stable_count
-    global arrow_missing_count
-    global arrow_count_armed
-    global third_arrow_trigger_count
-
     global text_full_count
     global text_candidate_type
 
     global yolo_ir_waiting
     global yolo_ir_consumed
+    global auto_start_time
+    global initial_25s_done
 
     while not stop_event.is_set():
 
@@ -709,94 +621,6 @@ def control_loop():
             last_error = error
 
         # ----------------------------------------------------
-        # 카메라 화살표 검출 / 1,2,3 카운팅
-        # ----------------------------------------------------
-        arrow_target = detect_arrow_bbox(
-            black_mask
-        )
-
-        if (
-            arrow_count < 3
-            and drive_state == "CENTERLINE"
-        ):
-            if arrow_target is not None:
-                arrow_missing_count = 0
-
-                if arrow_count_armed:
-                    arrow_stable_count += 1
-
-                    if (
-                        arrow_stable_count
-                        >= ARROW_STABLE_FRAMES
-                    ):
-                        arrow_count += 1
-                        arrow_count_armed = False
-                        arrow_stable_count = 0
-
-                        print(
-                            f"[CAMERA ARROW] {arrow_count}"
-                        )
-
-            else:
-                arrow_stable_count = 0
-
-                if not arrow_count_armed:
-                    arrow_missing_count += 1
-
-                    if (
-                        arrow_missing_count
-                        >= ARROW_GONE_FRAMES
-                    ):
-                        arrow_count_armed = True
-                        arrow_missing_count = 0
-
-        else:
-            arrow_stable_count = 0
-
-        # ----------------------------------------------------
-        # 3번째 화살표 거리 기준선
-        # ----------------------------------------------------
-        if (
-            drive_state == "CENTERLINE"
-            and arrow_count == 3
-            and arrow_target is not None
-        ):
-            ax, ay, aw, ah = (
-                arrow_target["bbox"]
-            )
-
-            arrow_bottom = (
-                ay + ah
-            )
-
-            trigger_y = int(
-                roi_h
-                * THIRD_ARROW_TRIGGER_RATIO
-            )
-
-            if arrow_bottom >= trigger_y:
-                third_arrow_trigger_count += 1
-            else:
-                third_arrow_trigger_count = 0
-
-            if (
-                third_arrow_trigger_count
-                >= THIRD_ARROW_TRIGGER_FRAMES
-            ):
-                stop_robot()
-
-                drive_state = "SEARCH_TEXT"
-                state_start_time = time.time()
-
-                third_arrow_trigger_count = 0
-                text_full_count = 0
-                text_candidate_type = None
-
-                print(
-                    "[ARROW 3] distance line reached -> SEARCH_TEXT"
-                )
-
-        # ----------------------------------------------------
         # YOLO
         #
         # 첫 번째 3번째 화살표 이후부터는
@@ -805,7 +629,7 @@ def control_loop():
         text_target = None
 
         if (
-            arrow_count >= 3
+            initial_25s_done
             and drive_state in (
                 "CENTERLINE",
                 "SEARCH_TEXT",
@@ -857,76 +681,158 @@ def control_loop():
             # ================================================
             if drive_state == "CENTERLINE":
 
-                # 3번째 화살표 이후에는
-                # 중심선 추종 중 다음 STOP/STATION이 다시 보이면
-                # 새 YOLO -> IR 1회 사이클 시작
-                if (
-                    arrow_count >= 3
-                    and text_target is not None
-                    and not yolo_ir_waiting
-                    and not yolo_ir_consumed
-                ):
-                    stop_robot()
+                # ------------------------------------------------
+                # 최초 AUTO 시작 후 딱 한 번만 25초 중심선 추종
+                # ------------------------------------------------
+                if not initial_25s_done:
 
-                    yolo_ir_waiting = True
-                    drive_state = "ALIGN_TEXT"
+                    if auto_start_time is None:
+                        auto_start_time = time.time()
 
-                    print(
-                        f"[YOLO] next {text_target['type']} detected "
-                        "-> ALIGN_TEXT / wait next IR"
+                    elapsed_centerline = (
+                        time.time()
+                        - auto_start_time
                     )
 
-                elif error is not None:
-                    correction = (
-                        KP * error
-                    )
+                    if elapsed_centerline >= CENTERLINE_RUN_SEC:
+                        stop_robot()
 
-                    left_speed = (
-                        BASE_SPEED
-                        + correction
-                    )
+                        initial_25s_done = True
+                        drive_state = "SEARCH_TEXT"
+                        state_start_time = time.time()
 
-                    right_speed = (
-                        BASE_SPEED
-                        - correction
-                    )
+                        text_full_count = 0
+                        text_candidate_type = None
 
-                    left_speed = int(
-                        np.clip(
+                        print(
+                            "[TIMER] first 25s centerline done -> SEARCH_TEXT"
+                        )
+
+                    elif error is not None:
+                        correction = (
+                            KP * error
+                        )
+
+                        left_speed = (
+                            BASE_SPEED
+                            + correction
+                        )
+
+                        right_speed = (
+                            BASE_SPEED
+                            - correction
+                        )
+
+                        left_speed = int(
+                            np.clip(
+                                left_speed,
+                                0,
+                                MAX_SPEED
+                            )
+                        )
+
+                        right_speed = int(
+                            np.clip(
+                                right_speed,
+                                0,
+                                MAX_SPEED
+                            )
+                        )
+
+                        drive(
                             left_speed,
-                            0,
-                            MAX_SPEED
-                        )
-                    )
-
-                    right_speed = int(
-                        np.clip(
-                            right_speed,
-                            0,
-                            MAX_SPEED
-                        )
-                    )
-
-                    drive(
-                        left_speed,
-                        right_speed
-                    )
-
-                else:
-                    if last_error < 0:
-                        drive(
-                            0,
-                            SEARCH_SPEED
-                        )
-
-                    elif last_error > 0:
-                        drive(
-                            SEARCH_SPEED,
-                            0
+                            right_speed
                         )
 
                     else:
+                        if last_error < 0:
+                            drive(
+                                0,
+                                SEARCH_SPEED
+                            )
+
+                        elif last_error > 0:
+                            drive(
+                                SEARCH_SPEED,
+                                0
+                            )
+
+                        else:
+                            stop_robot()
+
+                # ------------------------------------------------
+                # 최초 25초 과정이 끝난 뒤:
+                # 시간 제한 없이 계속 중심선 추종
+                # 다음 STOP/STATION이 보이면 다시 YOLO 정렬/직진
+                # ------------------------------------------------
+                else:
+
+                    if (
+                        text_target is not None
+                        and not yolo_ir_waiting
+                        and not yolo_ir_consumed
+                    ):
                         stop_robot()
+
+                        yolo_ir_waiting = True
+                        drive_state = "ALIGN_TEXT"
+
+                        print(
+                            f"[YOLO] next {text_target['type']} detected "
+                            "during CENTERLINE -> ALIGN_TEXT / wait next IR"
+                        )
+
+                    elif error is not None:
+                        correction = (
+                            KP * error
+                        )
+
+                        left_speed = (
+                            BASE_SPEED
+                            + correction
+                        )
+
+                        right_speed = (
+                            BASE_SPEED
+                            - correction
+                        )
+
+                        left_speed = int(
+                            np.clip(
+                                left_speed,
+                                0,
+                                MAX_SPEED
+                            )
+                        )
+
+                        right_speed = int(
+                            np.clip(
+                                right_speed,
+                                0,
+                                MAX_SPEED
+                            )
+                        )
+
+                        drive(
+                            left_speed,
+                            right_speed
+                        )
+
+                    else:
+                        if last_error < 0:
+                            drive(
+                                0,
+                                SEARCH_SPEED
+                            )
+
+                        elif last_error > 0:
+                            drive(
+                                SEARCH_SPEED,
+                                0
+                            )
+
+                        else:
+                            stop_robot()
 
             # ================================================
             # SEARCH_TEXT
@@ -1136,7 +1042,7 @@ def control_loop():
 
                     print(
                         "[IR] 3s stop done -> CENTERLINE / "
-                        "ready for next YOLO"
+                        "normal centerline follow"
                     )
 
         # ----------------------------------------------------
@@ -1192,61 +1098,6 @@ def control_loop():
                 -1
             )
 
-        if arrow_target is not None:
-            ax, ay, aw, ah = (
-                arrow_target["bbox"]
-            )
-
-            cv2.rectangle(
-                result,
-                (
-                    ax,
-                    ay + roi_start
-                ),
-                (
-                    ax + aw,
-                    ay + ah + roi_start
-                ),
-                (255, 0, 0),
-                2
-            )
-
-        if (
-            arrow_count == 3
-            and drive_state == "CENTERLINE"
-        ):
-            third_line_y = (
-                roi_start
-                + int(
-                    roi_h
-                    * THIRD_ARROW_TRIGGER_RATIO
-                )
-            )
-
-            cv2.line(
-                result,
-                (0, third_line_y),
-                (w, third_line_y),
-                (0, 0, 255),
-                2
-            )
-
-            cv2.putText(
-                result,
-                f"ARROW3 DIST LINE {THIRD_ARROW_TRIGGER_RATIO:.2f}",
-                (
-                    10,
-                    max(
-                        20,
-                        third_line_y - 8
-                    )
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (0, 0, 255),
-                2
-            )
-
         if text_target is not None:
             x1, y1, x2, y2 = (
                 text_target["bbox"]
@@ -1300,15 +1151,29 @@ def control_loop():
             2
         )
 
-        cv2.putText(
-            result,
-            f"CAM ARROW: {arrow_count}/3",
-            (12, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (0, 255, 255),
-            2
-        )
+        if (
+            auto_mode
+            and drive_state == "CENTERLINE"
+            and not initial_25s_done
+            and auto_start_time is not None
+        ):
+            elapsed_show = min(
+                CENTERLINE_RUN_SEC,
+                time.time() - auto_start_time
+            )
+            remain_show = max(
+                0.0,
+                CENTERLINE_RUN_SEC - elapsed_show
+            )
+            cv2.putText(
+                result,
+                f"CENTERLINE TIMER: {remain_show:.1f}s",
+                (12, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 255, 255),
+                2
+            )
 
         cv2.putText(
             result,
@@ -1400,7 +1265,7 @@ button{
 </head>
 <body>
 
-<h2>Pinky Centerline + YOLO -> One IR</h2>
+<h2>Pinky 25s Centerline + YOLO -> One IR</h2>
 
 <img src="/video_feed">
 
@@ -1485,17 +1350,13 @@ def command(key):
     global manual_until
     global manual_cmd
 
-    global arrow_count
-    global arrow_stable_count
-    global arrow_missing_count
-    global arrow_count_armed
-    global third_arrow_trigger_count
-
     global text_full_count
     global text_candidate_type
 
     global yolo_ir_waiting
     global yolo_ir_consumed
+    global auto_start_time
+    global initial_25s_done
 
     global last_error
     global state_start_time
@@ -1505,7 +1366,12 @@ def command(key):
 
         if auto_mode:
             drive_state = "CENTERLINE"
-            print("AUTO ON")
+
+            if not initial_25s_done:
+                auto_start_time = time.time()
+                print("AUTO ON -> FIRST 25s CENTERLINE")
+            else:
+                print("AUTO ON -> NORMAL CENTERLINE")
         else:
             stop_robot()
             print("AUTO OFF")
@@ -1517,12 +1383,8 @@ def command(key):
         last_error = 0
         state_start_time = 0.0
 
-        arrow_count = 0
-        arrow_stable_count = 0
-        arrow_missing_count = 0
-        arrow_count_armed = True
-
-        third_arrow_trigger_count = 0
+        auto_start_time = None
+        initial_25s_done = False
 
         text_full_count = 0
         text_candidate_type = None
