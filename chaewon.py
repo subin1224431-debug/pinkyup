@@ -7,6 +7,8 @@ from flask import Flask, Response, render_template_string
 from pinkylib import Camera, Motor, IR
 from ultralytics import YOLO
 import os
+import zmq
+import json
 
 # ============================================================
 # Pinky Pro - 화살표 Blob 중심(OpenCV) + STOP/STATION(YOLO) 통합 주행
@@ -2347,11 +2349,45 @@ ir_event_lock_until = 0.0
 
     return "OK"
 
+
+
+# ============================================================
+# ZMQ 통신 클라이언트 대기 스레드
+# ============================================================
+def zmq_wait_for_start():
+    global auto_mode, state, auto_start_time
+
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+
+    # 노트북 서버 IP로 변경 필요
+    socket.connect("tcp://192.168.4.20:6000")
+
+    print("[핑키봇] 노트북 서버 접속 및 시작 명령 대기")
+
+    socket.send_string("핑키봇 준비 완료!")
+
+    response_raw = socket.recv_string()
+    response = json.loads(response_raw)
+
+    if response.get("status") == "START_AUTONAV":
+        print("[핑키봇] START_AUTONAV 수신 -> 자동주행 시작")
+
+        auto_mode = True
+        auto_start_time = time.time()
+        state = "START"
+
+
 # ============================================================
 # Main
 # ============================================================
 
 if __name__ == "__main__":
+    threading.Thread(
+        target=zmq_wait_for_start,
+        daemon=True
+    ).start()
+
     threading.Thread(
         target=control_loop,
         daemon=True
