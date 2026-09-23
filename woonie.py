@@ -9,6 +9,7 @@ from ultralytics import YOLO
 import os
 import zmq
 import json
+import socket
 
 # ============================================================
 # Pinky Pro - 화살표 Blob 중심(OpenCV) + STOP/STATION(YOLO) 통합 주행
@@ -248,30 +249,62 @@ second_reference_acquired = False
 
 
 # ============================================================
-# ZMQ 통신 클라이언트 대기 스레드
+# 기존 ZMQ 함수를 대체하는 통합 소켓 수신 스레드
 # ============================================================
-def zmq_wait_for_start():
+def wait_for_signals():
     global auto_mode, state, auto_start_time
     
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
-    socket.connect("tcp://192.168.4.20:6000")  # 노트북의 와이파이 IP
+    LAPTOP_IP = "192.168.4.20"
+    PORT = 6000
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
-    print("[핑키봇] 노트북(서버)에 접속 및 대기 해제 신호를 보냅니다...")
-    socket.send_string("핑키봇 준비 완료!")
+    print(f"[핑키봇] 노트북({LAPTOP_IP}:{PORT})에 접속 시도 중...")
     
-    # 노트북에서 넘겨주는 'p' 키 신호(START_AUTONAV)를 받을 때까지 대기
-    response_raw = socket.recv_string()
-    response = json.loads(response_raw)
+    # 노트북 서버가 켜질 때까지 무한 대기하며 접속 시도
+    while True:
+        try:
+            client_socket.connect((LAPTOP_IP, PORT))
+            break
+        except:
+            time.sleep(1)
+            
+    print("[핑키봇] 노트북 연결 성공! 신호를 기다립니다...")
     
-    if response.get("status") == "START_AUTONAV":
-        print("[핑키봇] 노트북으로부터 주행 시작 명령을 받았습니다. 주행을 시작합니다!")
-        
-        # 'p' 키를 눌렀을 때와 동일하게 주행 시작 변수 설정
-        auto_mode = True
-        auto_start_time = time.time()
-        state = "START"
-
+    # 주행 내내 백그라운드에서 신호를 계속 받기 위한 무한 루프
+    while True:
+        try:
+            data = client_socket.recv(1024).decode('utf-8').strip()
+            if not data:
+                break # 연결이 끊기면 루프 종료
+                
+            # 1. 주행 시작 신호를 받았을 때 (기존 ZMQ 응답 대체)
+            if "START" in data:
+                print("[핑키봇] 노트북으로부터 주행 시작 명령을 받았습니다. 주행을 시작합니다!")
+                auto_mode = True
+                auto_start_time = time.time()
+                state = "START"
+                
+            # 2. 숫자(YOLO 카운트)를 받았을 때 (새로운 기능)
+            else:
+                img = Image.new('RGB', (img_width, img_height), color=(0, 0, 0))
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype("DejaVuSans.ttf", 90)
+                except:
+                    font = ImageFont.load_default()
+                    
+                x1, y1, x2, y2 = draw.textbbox((0, 0), data, font=font)
+                x = (img_width - (x2 - x1)) // 2
+                y = (img_height - (y2 - y1)) // 2
+                
+                draw.text((x, y), data, font=font, fill=(255, 255, 255))
+                lcd.img_show(img)
+                
+        except Exception as e:
+            print(f"[통신 에러] {e}")
+            break
+            
+    client_socket.close()
 
 # ============================================================
 # Motor helpers
