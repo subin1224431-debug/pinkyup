@@ -118,6 +118,24 @@ YOLO_CONF = 0.45
 YOLO_IMGSZ = 320
 TEXT_CLASSES = {"STOP", "STATION", "GOAL"}
 
+# ============================================================
+# ★ [조정용] 화살표 인식 완전 차단
+# 화살표는 "없는 것"으로 취급: YOLO 결과에서 절대 나오지 않게 3중으로 막음
+#  1) 모델에게 STOP/STATION/GOAL 클래스만 출력하게 요청 (classes 필터)
+#  2) 이름에 아래 단어가 들어간 클래스는 무조건 버림
+#  3) 글씨는 가로로 긴 모양 -> 박스 가로/세로 비율이 아래 값보다 작으면 버림
+#     (화살표를 STOP 등으로 잘못 인식해도 모양이 달라서 걸러짐)
+#     진짜 글씨가 버려지면 값을 낮추고, 화살표가 계속 잡히면 값을 올릴 것
+#     버려진 박스는 화면에 회색으로 "REJECT 비율"이 표시됨
+# ============================================================
+ARROW_BLOCK_WORDS = ("ARROW", "LEFT", "RIGHT", "STRAIGHT", "TURN", "화살")
+TEXT_MIN_ASPECT = {
+    "STOP": 1.5,
+    "STATION": 2.0,
+    "GOAL": 1.5,
+}
+yolo_rejected = []   # 화면 표시용: 이번 프레임에서 버려진 박스
+
 # 현재 코스에서 찾아야 하는 표지 순서
 # STOP1 -> STATION -> STOP2 -> GOAL
 route_stage = "STOP1"
@@ -126,7 +144,7 @@ route_stage = "STOP1"
 STATION_FORWARD_SEC = 3.0
 
 # ============================================================
-# ★ [조정용] STATION 전체 글자 확인 (STATION_SEEK_FULL)
+# ★ [조정용] 글자 전체 확인 (TEXT_SEEK_FULL) - STOP / STATION 공통
 # "STATIO"까지만 보이는 상태로 출발하지 않도록,
 # S부터 N까지 박스 전체가 화면 안에 들어올 때까지 제자리 회전
 # ============================================================
@@ -138,6 +156,23 @@ STATION_SEEK_PULSE_OFF = 0.15     #            이만큼 멈춰서 YOLO가 다�
 STATION_SEEK_LOST_TIMEOUT = 3.0   # 이 시간 이상 STATION을 못 보면 중심선 추종으로 복귀
 station_seek_dir = 1              # 1 = 오른쪽 회전, -1 = 왼쪽 회전
 station_seek_lost_since = None
+
+# 전체 글자 확인(회전 정렬)을 적용할 글씨 종류 (STOP1/STATION/STOP2 모두 동일하게)
+SEEK_FULL_TYPES = {"STOP", "STATION"}
+
+# ============================================================
+# ★ [조정용] 이벤트 2 오인식 방지 (화살표 등)
+# ============================================================
+# 중심선 주행 중 글씨가 이 프레임 수만큼 "연속" 보여야 이벤트 2 실행
+# (화살표가 한두 프레임 STOP으로 잘못 잡혀도 무시하고 계속 주행)
+EVENT2_CONFIRM_FRAMES = 3
+event2_hits = 0
+
+# 구간별 최소 신뢰도: 화살표가 있는 STOP2 구간은 더 엄격하게
+# 진짜 STOP2를 못 잡으면 0.50 정도로 낮출 것
+STAGE_MIN_CONF = {
+    "STOP2": 0.60,
+}
 
 # ============================================================
 # STATION 이후 화살표 처리
@@ -193,6 +228,20 @@ except Exception as e:
 
 print("YOLO model loaded.")
 print("YOLO classes:", yolo_model.names)
+
+# [차단 1용] 허용 클래스 id 목록 (화살표 클래스가 모델에 있어도 제외됨)
+_names = yolo_model.names
+_names = _names.items() if isinstance(_names, dict) else enumerate(_names)
+ALLOWED_CLASS_IDS = [
+    int(i) for i, n in _names
+    if str(n).upper().strip() in TEXT_CLASSES
+    and not any(word in str(n).upper() for word in ARROW_BLOCK_WORDS)
+]
+if not ALLOWED_CLASS_IDS:
+    # 클래스 이름이 예상과 다르면 필터를 끄고 이름 검사(차단 2, 3)로만 막음
+    print("[WARN] STOP/STATION/GOAL class names not found in model -> classes filter off")
+    ALLOWED_CLASS_IDS = None
+print("YOLO allowed class ids (arrow blocked):", ALLOWED_CLASS_IDS)
 
 
 # ============================================================
@@ -364,10 +413,14 @@ def fill_arrow_as_road(white_mask):
 # YOLO STOP / STATION 검출
 # ============================================================
 def detect_text_yolo(frame, y_offset=0, expected_class=None):
+    yolo_rejected.clear()
+
+    # [차단 1] 모델이 STOP/STATION/GOAL 클래스만 출력하도록 제한
     results = yolo_model(
         frame,
         imgsz=YOLO_IMGSZ,
         conf=YOLO_CONF,
+        classes=ALLOWED_CLASS_IDS,
         verbose=False
     )
 
@@ -385,6 +438,14 @@ def detect_text_yolo(frame, y_offset=0, expected_class=None):
         conf = float(box.conf[0])
         name = str(yolo_model.names[cls_id]).upper().strip()
 
+        # 구간별 최소 신뢰도 (STOP2 구간은 더 엄격)
+        if conf < STAGE_MIN_CONF.get(route_stage, YOLO_CONF):
+            continue
+
+        # [차단 2] 화살표 계열 이름은 무조건 버림
+        if any(word in name for word in ARROW_BLOCK_WORDS):
+            continue
+
         if name not in TEXT_CLASSES:
             continue
 
@@ -392,6 +453,14 @@ def detect_text_yolo(frame, y_offset=0, expected_class=None):
             continue
 
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+        # [차단 3] 글씨처럼 가로로 길지 않으면(화살표 모양) 버림
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        aspect = bw / bh
+        if aspect < TEXT_MIN_ASPECT.get(name, 1.5):
+            yolo_rejected.append((x1, y1 + y_offset, x2, y2 + y_offset, name, aspect))
+            continue
 
         y1_full = y1 + y_offset
         y2_full = y2 + y_offset
@@ -432,6 +501,7 @@ def control_loop():
     global goal_missing_since
     global station_seek_dir
     global station_seek_lost_since
+    global event2_hits
 
     def expected_class():
         if route_stage == "STOP1":
@@ -608,13 +678,14 @@ def control_loop():
         # YOLO (25초 이후부터 활성화)
         # ----------------------------------------------------
         text_target = None
+        yolo_rejected.clear()
 
         if (
             initial_25s_done
             and drive_state in (
                 "CENTERLINE",
                 "SEARCH_TEXT",
-                "STATION_SEEK_FULL",
+                "TEXT_SEEK_FULL",
                 "APPROACH_TEXT",
                 "DRIVE_TEXT",
                 "GOAL_APPROACH",
@@ -629,6 +700,13 @@ def control_loop():
                 )
             except Exception as e:
                 print("YOLO ERROR:", e)
+
+        # 이벤트 2 연속 확인 카운트 (CENTERLINE에서만 셈)
+        if drive_state == "CENTERLINE" and text_target is not None:
+            event2_hits += 1
+        else:
+            event2_hits = 0
+        event2_confirmed = event2_hits >= EVENT2_CONFIRM_FRAMES
 
         # ----------------------------------------------------
         # Manual override
@@ -664,24 +742,26 @@ def control_loop():
                     print("[TIMER] first 25s centerline done -> SEARCH_TEXT")
 
                 # [이벤트 2] 25초 이후 중심선 주행 중 STOP/STATION 글씨 감지 시
-                elif initial_25s_done and text_target is not None:
+                # (EVENT2_CONFIRM_FRAMES 프레임 연속으로 보여야 실행 -> 화살표 순간 오인식 무시)
+                elif initial_25s_done and text_target is not None and event2_confirmed:
                     current_text_type = text_target["type"]
+                    event2_hits = 0
 
                     if current_text_type == "GOAL":
                         drive_state = "GOAL_APPROACH"
                         goal_seen_near = False
                         goal_missing_since = None
                         print("[YOLO] GOAL detected -> GOAL_APPROACH")
-                    elif current_text_type == "STATION":
-                        # STATION은 "STATIO"처럼 잘려 보여도 바로 가지 않고
-                        # N까지 전부 화면에 들어올 때까지 회전하며 찾음
+                    elif current_text_type in SEEK_FULL_TYPES:
+                        # STOP / STATION 모두: 잘려 보여도 바로 가지 않고
+                        # 박스 전체가 화면에 들어올 때까지 회전하며 정렬
                         stop_robot()
                         text_full_count = 0
                         station_seek_dir = station_turn_dir(text_target, w)
                         station_seek_lost_since = None
                         state_start_time = time.time()
-                        drive_state = "STATION_SEEK_FULL"
-                        print("[STATION] detected -> STATION_SEEK_FULL (wait until all letters visible)")
+                        drive_state = "TEXT_SEEK_FULL"
+                        print(f"[YOLO] {current_text_type} detected -> TEXT_SEEK_FULL (wait until all letters visible)")
                     else:
                         drive_state = "APPROACH_TEXT"
                         print(f"[YOLO] {text_target['type']} detected -> APPROACH_TEXT")
@@ -696,12 +776,12 @@ def control_loop():
                     follow_centerline(error)
 
             # ================================================
-            # STATION_SEEK_FULL
+            # TEXT_SEEK_FULL (STOP / STATION 공통)
             # "STATIO"처럼 일부만 보이면 잘린 쪽으로 조금씩 회전,
-            # S~N 전체가 화면 안에 안정적으로 보이면 APPROACH_TEXT로 진행
+            # 글자 전체가 화면 안에 안정적으로 보이면 APPROACH_TEXT로 진행
             # (APPROACH_TEXT에서 글씨 중심을 맞추며 직진 -> 바닥 도달 -> 3초 직진 -> 3초 정지)
             # ================================================
-            elif drive_state == "STATION_SEEK_FULL":
+            elif drive_state == "TEXT_SEEK_FULL":
 
                 elapsed_seek = time.time() - state_start_time
 
@@ -721,7 +801,7 @@ def control_loop():
                         if text_full_count >= STATION_FULL_STABLE_FRAMES:
                             text_full_count = 0
                             drive_state = "APPROACH_TEXT"
-                            print("[STATION] all letters visible -> APPROACH_TEXT")
+                            print(f"[YOLO] {current_text_type} all letters visible -> APPROACH_TEXT")
                     else:
                         # 잘린 쪽으로 회전 방향 갱신 후 조금씩 회전
                         text_full_count = 0
@@ -738,7 +818,7 @@ def control_loop():
                         stop_robot()
                         current_text_type = None
                         drive_state = "CENTERLINE"
-                        print("[STATION] lost too long -> back to CENTERLINE")
+                        print(f"[YOLO] {current_text_type} lost too long -> back to CENTERLINE")
                     else:
                         station_seek_pulse(elapsed_seek, station_seek_dir)
 
@@ -1035,6 +1115,19 @@ def control_loop():
         if target_x is not None:
             cv2.circle(result, (int(target_x), int(target_y)), 9, (0, 255, 255), -1)
 
+        # ★ [조정용] 모양 때문에 버려진 박스(화살표 등) - 회색으로 표시
+        for rx1, ry1, rx2, ry2, rname, raspect in yolo_rejected:
+            cv2.rectangle(result, (rx1, ry1), (rx2, ry2), (128, 128, 128), 1)
+            cv2.putText(
+                result,
+                f"REJECT {rname} {raspect:.1f}",
+                (rx1, max(20, ry1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (128, 128, 128),
+                1
+            )
+
         if text_target is not None:
             x1, y1, x2, y2 = text_target["bbox"]
             cv2.rectangle(result, (x1, y1), (x2, y2), (255, 0, 255), 2)
@@ -1224,6 +1317,7 @@ def command(key):
     global goal_missing_since
     global station_seek_dir
     global station_seek_lost_since
+    global event2_hits
 
     global last_error
     global state_start_time
@@ -1257,6 +1351,7 @@ def command(key):
         goal_missing_since = None
         station_seek_dir = 1
         station_seek_lost_since = None
+        event2_hits = 0
 
         text_full_count = 0
         text_candidate_type = None
