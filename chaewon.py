@@ -122,8 +122,22 @@ TEXT_CLASSES = {"STOP", "STATION", "GOAL"}
 # STOP1 -> STATION -> STOP2 -> GOAL
 route_stage = "STOP1"
 
-# STATION: 박스 하단이 화면 밑에 닿으면 회전 없이 2초 직진 -> 3초 정지
+# STATION: 박스 하단이 화면 밑에 닿으면 회전 없이 3초 직진 -> 3초 정지
 STATION_FORWARD_SEC = 3.0
+
+# ============================================================
+# ★ [조정용] STATION 전체 글자 확인 (STATION_SEEK_FULL)
+# "STATIO"까지만 보이는 상태로 출발하지 않도록,
+# S부터 N까지 박스 전체가 화면 안에 들어올 때까지 제자리 회전
+# ============================================================
+STATION_FULL_MARGIN = 35          # 박스 좌우가 화면 끝에서 이 픽셀 이상 떨어져야 "전체 보임"
+STATION_FULL_STABLE_FRAMES = 3    # 전체 보임이 연속 몇 프레임 유지돼야 출발할지
+STATION_SEEK_TURN_SPEED = 14      # 찾기 회전 속도 (크면 지나침, 작으면 안 돔)
+STATION_SEEK_PULSE_ON = 0.12      # 회전 펄스: 이만큼 돌고
+STATION_SEEK_PULSE_OFF = 0.15     #            이만큼 멈춰서 YOLO가 다시 보게 함
+STATION_SEEK_LOST_TIMEOUT = 3.0   # 이 시간 이상 STATION을 못 보면 중심선 추종으로 복귀
+station_seek_dir = 1              # 1 = 오른쪽 회전, -1 = 왼쪽 회전
+station_seek_lost_since = None
 
 # ============================================================
 # STATION 이후 화살표 처리
@@ -243,6 +257,33 @@ def drive(left, right):
 
 def stop_robot():
     motor.move(0, 0)
+
+
+# STATION 박스가 어느 쪽에서 잘렸는지 보고 회전 방향 결정
+#   오른쪽이 잘림(N이 안 보임) -> 오른쪽 회전(1)
+#   왼쪽이 잘림(S가 안 보임)   -> 왼쪽 회전(-1)
+def station_turn_dir(target, frame_w):
+    x1, _, x2, _ = target["bbox"]
+    left_cut = x1 < STATION_FULL_MARGIN
+    right_cut = x2 > frame_w - STATION_FULL_MARGIN
+
+    if right_cut and not left_cut:
+        return 1
+    if left_cut and not right_cut:
+        return -1
+
+    # 양쪽 다 잘렸거나 애매하면 글씨 중심이 있는 쪽으로
+    cx = (x1 + x2) // 2
+    return 1 if cx >= frame_w // 2 else -1
+
+
+# 조금 돌고 잠깐 멈추는 펄스 회전 (YOLO 지연 때문에 지나치지 않게)
+def station_seek_pulse(elapsed, direction):
+    cycle = STATION_SEEK_PULSE_ON + STATION_SEEK_PULSE_OFF
+    if (elapsed % cycle) < STATION_SEEK_PULSE_ON:
+        drive(direction * STATION_SEEK_TURN_SPEED, -direction * STATION_SEEK_TURN_SPEED)
+    else:
+        stop_robot()
 
 
 # ============================================================
@@ -389,6 +430,8 @@ def control_loop():
     global route_stage
     global goal_seen_near
     global goal_missing_since
+    global station_seek_dir
+    global station_seek_lost_since
 
     def expected_class():
         if route_stage == "STOP1":
@@ -571,6 +614,7 @@ def control_loop():
             and drive_state in (
                 "CENTERLINE",
                 "SEARCH_TEXT",
+                "STATION_SEEK_FULL",
                 "APPROACH_TEXT",
                 "DRIVE_TEXT",
                 "GOAL_APPROACH",
@@ -628,6 +672,16 @@ def control_loop():
                         goal_seen_near = False
                         goal_missing_since = None
                         print("[YOLO] GOAL detected -> GOAL_APPROACH")
+                    elif current_text_type == "STATION":
+                        # STATION은 "STATIO"처럼 잘려 보여도 바로 가지 않고
+                        # N까지 전부 화면에 들어올 때까지 회전하며 찾음
+                        stop_robot()
+                        text_full_count = 0
+                        station_seek_dir = station_turn_dir(text_target, w)
+                        station_seek_lost_since = None
+                        state_start_time = time.time()
+                        drive_state = "STATION_SEEK_FULL"
+                        print("[STATION] detected -> STATION_SEEK_FULL (wait until all letters visible)")
                     else:
                         drive_state = "APPROACH_TEXT"
                         print(f"[YOLO] {text_target['type']} detected -> APPROACH_TEXT")
@@ -640,6 +694,53 @@ def control_loop():
                 # [기본 상태] 별도 이벤트가 없으면 무조건 '중심선 추종(PID/검색)'
                 else:
                     follow_centerline(error)
+
+            # ================================================
+            # STATION_SEEK_FULL
+            # "STATIO"처럼 일부만 보이면 잘린 쪽으로 조금씩 회전,
+            # S~N 전체가 화면 안에 안정적으로 보이면 APPROACH_TEXT로 진행
+            # (APPROACH_TEXT에서 글씨 중심을 맞추며 직진 -> 바닥 도달 -> 3초 직진 -> 3초 정지)
+            # ================================================
+            elif drive_state == "STATION_SEEK_FULL":
+
+                elapsed_seek = time.time() - state_start_time
+
+                if text_target is not None:
+                    station_seek_lost_since = None
+                    x1, _, x2, _ = text_target["bbox"]
+                    fully_inside = (
+                        x1 >= STATION_FULL_MARGIN
+                        and x2 <= (w - STATION_FULL_MARGIN)
+                    )
+
+                    if fully_inside:
+                        # 전체 글자가 보이면 멈춘 상태로 몇 프레임 확인
+                        stop_robot()
+                        text_full_count += 1
+
+                        if text_full_count >= STATION_FULL_STABLE_FRAMES:
+                            text_full_count = 0
+                            drive_state = "APPROACH_TEXT"
+                            print("[STATION] all letters visible -> APPROACH_TEXT")
+                    else:
+                        # 잘린 쪽으로 회전 방향 갱신 후 조금씩 회전
+                        text_full_count = 0
+                        station_seek_dir = station_turn_dir(text_target, w)
+                        station_seek_pulse(elapsed_seek, station_seek_dir)
+                else:
+                    # 회전 중 잠깐 놓쳐도 같은 방향으로 계속 조금씩 회전
+                    text_full_count = 0
+                    if station_seek_lost_since is None:
+                        station_seek_lost_since = time.time()
+
+                    if time.time() - station_seek_lost_since >= STATION_SEEK_LOST_TIMEOUT:
+                        # 너무 오래 못 찾으면 중심선 추종으로 복귀 (다시 보이면 이벤트 2로 재진입)
+                        stop_robot()
+                        current_text_type = None
+                        drive_state = "CENTERLINE"
+                        print("[STATION] lost too long -> back to CENTERLINE")
+                    else:
+                        station_seek_pulse(elapsed_seek, station_seek_dir)
 
             # ================================================
             # SEARCH_TEXT
@@ -1121,6 +1222,8 @@ def command(key):
     global route_stage
     global goal_seen_near
     global goal_missing_since
+    global station_seek_dir
+    global station_seek_lost_since
 
     global last_error
     global state_start_time
@@ -1152,6 +1255,8 @@ def command(key):
         route_stage = "STOP1"
         goal_seen_near = False
         goal_missing_since = None
+        station_seek_dir = 1
+        station_seek_lost_since = None
 
         text_full_count = 0
         text_candidate_type = None
