@@ -85,6 +85,18 @@ MAX_POINTS = 8
 INTERNAL_GAP_RATIO = 0.30
 
 # ============================================================
+# ★★★ [조정용] 25초 이후(이벤트2 이후) 중심선 우측 오프셋 ★★★
+# ------------------------------------------------------------
+# 25초 이후 중심선 추종 시, 실제 도로 중심보다 오른쪽 선을 따라가게 함
+#   0.0 = 도로 정중앙 (기존과 동일)
+#   0.3 = 중앙에서 오른쪽 가장자리 방향으로 30% 이동  <- 현재값
+#   1.0 = 도로 오른쪽 가장자리
+#   음수(-0.3 등) = 왼쪽으로 이동
+# 화면에 주황색 선/점으로 이 "보정된 추종선"이 표시됨
+# ============================================================
+CENTERLINE_RIGHT_OFFSET_RATIO = 0.3
+
+# ============================================================
 # 시작 후 25초 동안 중심선 추종
 # ============================================================
 CENTERLINE_RUN_SEC = 25.0
@@ -105,7 +117,7 @@ TEXT_CLASSES = {"STOP", "STATION", "GOAL"}
 route_stage = "STOP1"
 
 # STATION: 박스 하단이 화면 밑에 닿으면 회전 없이 2초 직진 -> 3초 정지
-STATION_FORWARD_SEC = 2.0
+STATION_FORWARD_SEC = 3.0
 
 # ============================================================
 # STATION 이후 화살표 처리
@@ -429,6 +441,7 @@ def control_loop():
         # 중심선 계산
         # ----------------------------------------------------
         center_points = []
+        road_half_widths = []
         prev_center = None
 
         for y in range(roi_h - 1, 0, -STEP):
@@ -473,17 +486,34 @@ def control_loop():
 
             original_y = y + roi_start
             center_points.append((x_center, original_y))
+            road_half_widths.append((x_right - x_left) / 2.0)
             prev_center = x_center
 
             if len(center_points) >= MAX_POINTS:
                 break
 
+        # ----------------------------------------------------
+        # ★ [조정용] 25초 이후 우측 오프셋 추종선
+        # 도로 검출(center_points)은 그대로 두고,
+        # 실제로 따라갈 점(follow_points)만 오른쪽으로 이동
+        # 오프셋 = CENTERLINE_RIGHT_OFFSET_RATIO x (도로 폭의 절반)
+        # ----------------------------------------------------
+        use_right_offset = initial_25s_done and CENTERLINE_RIGHT_OFFSET_RATIO != 0
+
+        if use_right_offset:
+            follow_points = [
+                (int(cx + CENTERLINE_RIGHT_OFFSET_RATIO * hw), cy)
+                for (cx, cy), hw in zip(center_points, road_half_widths)
+            ]
+        else:
+            follow_points = center_points
+
         target_x = None
         target_y = None
         error = None
 
-        if len(center_points) >= 3:
-            target_x, target_y = center_points[2]
+        if len(follow_points) >= 3:
+            target_x, target_y = follow_points[2]
 
         if target_x is not None:
             error = target_x - w // 2
@@ -862,6 +892,22 @@ def control_loop():
 
         for i in range(len(center_points) - 1):
             cv2.line(result, center_points[i], center_points[i + 1], (255, 0, 0), 3)
+
+        # ★ [조정용] 우측 오프셋 추종선 (주황색) - 실제로 따라가는 선
+        if use_right_offset:
+            for i in range(len(follow_points) - 1):
+                cv2.line(result, follow_points[i], follow_points[i + 1], (0, 165, 255), 3)
+            for x, y in follow_points:
+                cv2.circle(result, (x, y), 4, (0, 165, 255), -1)
+            cv2.putText(
+                result,
+                f"R-OFFSET: {CENTERLINE_RIGHT_OFFSET_RATIO:+.2f}",
+                (12, 76),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 165, 255),
+                2
+            )
 
         if target_x is not None:
             cv2.circle(result, (int(target_x), int(target_y)), 9, (0, 255, 255), -1)
