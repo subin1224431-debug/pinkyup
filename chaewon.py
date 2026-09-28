@@ -85,16 +85,22 @@ MAX_POINTS = 8
 INTERNAL_GAP_RATIO = 0.30
 
 # ============================================================
-# ★★★ [조정용] 25초 이후(이벤트2 이후) 중심선 우측 오프셋 ★★★
+# ★★★ [조정용] 이벤트 3: STATION 이후 우측 오프셋 중심선 ★★★
 # ------------------------------------------------------------
-# 25초 이후 중심선 추종 시, 실제 도로 중심보다 오른쪽 선을 따라가게 함
-#   0.0 = 도로 정중앙 (기존과 동일)
-#   0.3 = 중앙에서 오른쪽 가장자리 방향으로 30% 이동  <- 현재값
-#   1.0 = 도로 오른쪽 가장자리
-#   음수(-0.3 등) = 왼쪽으로 이동
-# 화면에 주황색 선/점으로 이 "보정된 추종선"이 표시됨
+# STATION 통과 후(STOP2 찾는 구간)에는 실제 도로 중심보다
+# 살짝 오른쪽에 만든 "새 중심선"을 따라감 (화면에 주황색 선)
+#
+#   0.0  = 도로 정중앙 (기존과 동일)
+#   0.15 = 중앙에서 오른쪽 가장자리 방향으로 15% 이동  <- 현재값
+#   0.3  = 30% 이동 (이전 값, 너무 돌아서 줄임)
+#   1.0  = 도로 오른쪽 가장자리
+#   음수(-0.1 등) = 왼쪽으로 이동
+#
+# 적용 구간: RIGHT_OFFSET_STAGES 에 들어있는 route_stage
+#   GOAL 구간에도 쓰고 싶으면 {"STOP2", "GOAL"} 로 변경
 # ============================================================
-CENTERLINE_RIGHT_OFFSET_RATIO = 0.3
+CENTERLINE_RIGHT_OFFSET_RATIO = 0.15
+RIGHT_OFFSET_STAGES = {"STOP2"}
 
 # ============================================================
 # 시작 후 25초 동안 중심선 추종
@@ -395,6 +401,37 @@ def control_loop():
             return "GOAL"
         return None
 
+    # 중심선 추종(PID/검색) - 기본 상태와 이벤트 3이 같이 사용
+    def follow_centerline(err):
+        if err is not None:
+            # 커브 감속 + 안쪽 바퀴 역회전 허용
+            base = max(
+                MIN_CURVE_SPEED,
+                BASE_SPEED - CURVE_SLOWDOWN * abs(err)
+            )
+
+            correction = KP * err
+
+            left_speed = int(np.clip(
+                base + correction,
+                INNER_MIN_SPEED,
+                MAX_SPEED
+            ))
+            right_speed = int(np.clip(
+                base - correction,
+                INNER_MIN_SPEED,
+                MAX_SPEED
+            ))
+            drive(left_speed, right_speed)
+
+        else:
+            if last_error < 0:
+                drive(SEARCH_INNER_SPEED, SEARCH_SPEED)
+            elif last_error > 0:
+                drive(SEARCH_SPEED, SEARCH_INNER_SPEED)
+            else:
+                stop_robot()
+
     while not stop_event.is_set():
 
         frame = camera.get_frame()
@@ -492,32 +529,37 @@ def control_loop():
             if len(center_points) >= MAX_POINTS:
                 break
 
-        # ----------------------------------------------------
-        # ★ [조정용] 25초 이후 우측 오프셋 추종선
-        # 도로 검출(center_points)은 그대로 두고,
-        # 실제로 따라갈 점(follow_points)만 오른쪽으로 이동
-        # 오프셋 = CENTERLINE_RIGHT_OFFSET_RATIO x (도로 폭의 절반)
-        # ----------------------------------------------------
-        use_right_offset = initial_25s_done and CENTERLINE_RIGHT_OFFSET_RATIO != 0
-
-        if use_right_offset:
-            follow_points = [
-                (int(cx + CENTERLINE_RIGHT_OFFSET_RATIO * hw), cy)
-                for (cx, cy), hw in zip(center_points, road_half_widths)
-            ]
-        else:
-            follow_points = center_points
-
         target_x = None
         target_y = None
         error = None
 
-        if len(follow_points) >= 3:
-            target_x, target_y = follow_points[2]
+        if len(center_points) >= 3:
+            target_x, target_y = center_points[2]
 
         if target_x is not None:
             error = target_x - w // 2
             last_error = error
+
+        # ----------------------------------------------------
+        # ★ [조정용] 이벤트 3용 우측 오프셋 중심선 계산
+        # 도로 검출(center_points)은 그대로 두고,
+        # 오른쪽으로 옮긴 새 중심선(offset_points)을 따로 만든다
+        # 오프셋 = CENTERLINE_RIGHT_OFFSET_RATIO x (도로 폭의 절반)
+        # ----------------------------------------------------
+        use_right_offset = route_stage in RIGHT_OFFSET_STAGES
+
+        offset_points = [
+            (int(cx + CENTERLINE_RIGHT_OFFSET_RATIO * hw), cy)
+            for (cx, cy), hw in zip(center_points, road_half_widths)
+        ]
+
+        offset_target_x = None
+        offset_target_y = None
+        offset_error = None
+
+        if len(offset_points) >= 3:
+            offset_target_x, offset_target_y = offset_points[2]
+            offset_error = offset_target_x - w // 2
 
         # ----------------------------------------------------
         # YOLO (25초 이후부터 활성화)
@@ -590,36 +632,14 @@ def control_loop():
                         drive_state = "APPROACH_TEXT"
                         print(f"[YOLO] {text_target['type']} detected -> APPROACH_TEXT")
 
+                # [이벤트 3] STATION 이후(STOP2 찾는 구간): 우측 오프셋 중심선 추종
+                # ★ [조정용] 오프셋 크기는 CENTERLINE_RIGHT_OFFSET_RATIO 에서 조정
+                elif route_stage in RIGHT_OFFSET_STAGES:
+                    follow_centerline(offset_error)
+
                 # [기본 상태] 별도 이벤트가 없으면 무조건 '중심선 추종(PID/검색)'
                 else:
-                    if error is not None:
-                        # 커브 감속 + 안쪽 바퀴 역회전 허용
-                        base = max(
-                            MIN_CURVE_SPEED,
-                            BASE_SPEED - CURVE_SLOWDOWN * abs(error)
-                        )
-
-                        correction = KP * error
-
-                        left_speed = int(np.clip(
-                            base + correction,
-                            INNER_MIN_SPEED,
-                            MAX_SPEED
-                        ))
-                        right_speed = int(np.clip(
-                            base - correction,
-                            INNER_MIN_SPEED,
-                            MAX_SPEED
-                        ))
-                        drive(left_speed, right_speed)
-
-                    else:
-                        if last_error < 0:
-                            drive(SEARCH_INNER_SPEED, SEARCH_SPEED)
-                        elif last_error > 0:
-                            drive(SEARCH_SPEED, SEARCH_INNER_SPEED)
-                        else:
-                            stop_robot()
+                    follow_centerline(error)
 
             # ================================================
             # SEARCH_TEXT
@@ -893,15 +913,17 @@ def control_loop():
         for i in range(len(center_points) - 1):
             cv2.line(result, center_points[i], center_points[i + 1], (255, 0, 0), 3)
 
-        # ★ [조정용] 우측 오프셋 추종선 (주황색) - 실제로 따라가는 선
+        # ★ [조정용] 이벤트 3 우측 오프셋 중심선 (주황색) - STATION 이후 실제로 따라가는 선
         if use_right_offset:
-            for i in range(len(follow_points) - 1):
-                cv2.line(result, follow_points[i], follow_points[i + 1], (0, 165, 255), 3)
-            for x, y in follow_points:
+            for i in range(len(offset_points) - 1):
+                cv2.line(result, offset_points[i], offset_points[i + 1], (0, 165, 255), 3)
+            for x, y in offset_points:
                 cv2.circle(result, (x, y), 4, (0, 165, 255), -1)
+            if offset_target_x is not None:
+                cv2.circle(result, (int(offset_target_x), int(offset_target_y)), 9, (0, 165, 255), 2)
             cv2.putText(
                 result,
-                f"R-OFFSET: {CENTERLINE_RIGHT_OFFSET_RATIO:+.2f}",
+                f"EVENT3 R-OFFSET: {CENTERLINE_RIGHT_OFFSET_RATIO:+.2f}",
                 (12, 76),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.52,
