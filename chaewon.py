@@ -142,6 +142,20 @@ if not os.path.exists(MODEL_PATH):
 
 print("Loading YOLO model...")
 yolo_model = YOLO(MODEL_PATH)
+
+# YOLO warm-up (첫 추론 지연 방지)
+try:
+    dummy = np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8)
+    yolo_model(
+        dummy,
+        imgsz=YOLO_IMGSZ,
+        conf=YOLO_CONF,
+        verbose=False
+    )
+    print("YOLO warm-up complete.")
+except Exception as e:
+    print("YOLO warm-up error:", e)
+
 print("YOLO model loaded.")
 print("YOLO classes:", yolo_model.names)
 
