@@ -37,7 +37,7 @@ LAPTOP_ZMQ_PORT = 6000
 # 주행 설정
 # ============================================================
 BASE_SPEED = 20
-KP = 0.12
+KP = 0.13
 MAX_SPEED = 32
 SEARCH_SPEED = 12
 
@@ -105,7 +105,7 @@ station_align_count = 0
 
 # 마지막 STOP2 이후 GOAL 구간
 FINAL_STOP_FORWARD_SEC = 3.0
-FINAL_RIGHT_TURN_SEC = 0.90
+FINAL_RIGHT_TURN_SEC = 0.55
 
 # STOP2 이후 새 도로 재탐색용
 final_centerline_reset = False
@@ -120,7 +120,7 @@ TEXT_FULL_MARGIN = 35
 TEXT_FULL_STABLE_FRAMES = 3
 
 TEXT_ALIGN_TRIGGER_RATIO = 0.60
-TEXT_BOTTOM_TURN_SEC = 0.6
+TEXT_BOTTOM_TURN_SEC = 0.0
 
 STATION_PRE_TURN_FORWARD_SEC = 1.0
 STATION_FORWARD_AFTER_TURN_SEC = 2.0
@@ -129,6 +129,7 @@ TEXT_BOTTOM_TRIGGER_RATIO = 0.98
 
 FORWARD_AFTER_TEXT_SEC = 3.0
 STOP_AFTER_TEXT_SEC = 3.0
+TEXT_REVERSE_SEC = 0.4
 
 text_full_count = 0
 text_candidate_type = None
