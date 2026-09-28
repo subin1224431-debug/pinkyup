@@ -29,8 +29,7 @@ camera.start()
 PORT = 5000
 
 # 노트북 ZMQ 서버 IP
-# 기존 Raspberry Pi 코드에서 사용하던 주소
-LAPTOP_ZMQ_IP = "172.20.10.14"
+LAPTOP_ZMQ_IP = "172.20.10.14" # 노트북 아이피
 LAPTOP_ZMQ_PORT = 6000
 
 
@@ -40,7 +39,14 @@ LAPTOP_ZMQ_PORT = 6000
 BASE_SPEED = 20
 KP = 0.12
 MAX_SPEED = 32
-SEARCH_SPEED = 12
+
+# 커브 구간 감속 및 회전 강화 설정
+CURVE_SLOWDOWN = 0.05   # 중심선 오차가 커질수록 기본 속도 감소
+MIN_CURVE_SPEED = 12    # 커브 최소 속도
+INNER_MIN_SPEED = -10   # 안쪽 바퀴 역회전 허용 속도
+
+SEARCH_SPEED = 16
+SEARCH_INNER_SPEED = -6 # 중심선 이탈 시 안쪽 바퀴 역회전 탐색
 
 TEXT_FOLLOW_SPEED = 16
 TEXT_FOLLOW_KP = 0.10
@@ -54,17 +60,11 @@ CENTER_TOL = 30
 # ============================================================
 # ROI
 # ============================================================
-# 화면 아래쪽 절반(50%)만 중심선/YOLO 인식 영역으로 사용
 ROI_START_RATIO = 0.50
 
 
 # ============================================================
-# 흰색 / 검은색 HSV
-#
-# 중심선용 road_mask:
-# - 흰색 도로를 기준으로 잡음
-# - 도로 내부의 검은 화살표/황토색 박스는 흰색으로 메움
-# - 도로 바깥 황토색은 도로로 직접 등록하지 않음
+# HSV
 # ============================================================
 LOWER_WHITE = np.array([0, 0, 175], dtype=np.uint8)
 UPPER_WHITE = np.array([180, 75, 255], dtype=np.uint8)
@@ -91,87 +91,44 @@ CENTERLINE_RUN_SEC = 25.0
 auto_start_time = None
 initial_25s_done = False
 
-# ============================================================
-# 시간 기반 가상좌표
-#
-# 출발점을 (0, 0)으로 두고,
-# 명령한 좌/우 모터 속도를 이용해 대략적인 이동량/방향을 누적한다.
-# 엔코더/GPS가 없기 때문에 실제 m 좌표가 아니라 '가상 단위'이다.
-# 실험하면서 VIRTUAL_SPEED_SCALE 값을 보정해서 사용할 수 있다.
-# ============================================================
-virtual_x = 0.0
-virtual_y = 0.0
-virtual_theta = 0.0
-
-# 속도 명령 100일 때 1초 동안 이동하는 가상 거리
-# 실제 거리와 맞추려면 실험으로 보정
-VIRTUAL_SPEED_SCALE = 0.010
-
-# 좌우 속도 차이에 따른 회전각 누적 계수
-# 실제 회전량과 맞추려면 실험으로 보정
-VIRTUAL_TURN_SCALE = 0.020
-
-virtual_last_time = time.time()
-last_cmd_left = 0.0
-last_cmd_right = 0.0
 
 # ============================================================
-# STATION 가상좌표 트리거 설정
-#
-# 아직 실제 STATION 좌표를 측정하지 않았으므로 아래 값은 비활성 상태.
-# 실제 코스에서 원하는 STATION 위치의 VIRTUAL X / Y / TH 값을 확인한 뒤
-# STATION_COORD_ENABLED = True 로 바꾸고 목표값을 넣으면 된다.
-# ============================================================
-STATION_COORD_ENABLED = True
-
-STATION_TARGET_X = 2.31
-STATION_TARGET_Y = -0.31
-STATION_TARGET_TH_DEG = -239.31
-
-STATION_X_TOL = 0.25
-STATION_Y_TOL = 0.25
-STATION_TH_TOL_DEG = 15.0
-
-# STATION 가상좌표 도달 시 전용 동작
-# 기존 STATION YOLO 타이밍 로직과 별개로,
-# 좌표 도달 시에는 아래 순서만 실행한다.
-STATION_COORD_TURN_SEC = 0.4
-STATION_COORD_FORWARD_SEC = 2.0
-
-station_coord_triggered = False
-
-
-# ============================================================
-# YOLO STOP / 이후 글씨
-# STATION 전용 동작은 가상좌표로 처리
+# YOLO STOP / STATION
 # ============================================================
 MODEL_PATH = "best_ncnn_model"
 YOLO_CONF = 0.45
 YOLO_IMGSZ = 320
-TEXT_CLASSES = {"STOP", "STATION"}
+TEXT_CLASSES = {"STOP", "STATION", "GOAL"}
+
+# 현재 코스에서 찾아야 하는 표지 순서
+# STOP1 -> STATION -> STOP2 -> GOAL
+route_stage = "STOP1"
+
+# STATION 정렬
+STATION_ALIGN_Y_RATIO = 0.82
+STATION_CENTER_TOL = 25
+STATION_ALIGN_STABLE_FRAMES = 4
+station_align_count = 0
+
+# 마지막 STOP2 이후 GOAL 구간
+FINAL_STOP_FORWARD_SEC = 3.0
+FINAL_RIGHT_TURN_SEC = 0.90   # 90도 자체를 직접 측정할 수 없으므로 시간으로 근사. 현장에서 0.1초 단위로 튜닝
+GOAL_NEAR_RATIO = 0.70
+GOAL_MISS_TIMEOUT = 0.50
+goal_seen_near = False
+goal_missing_since = None
 
 TEXT_FULL_MARGIN = 35
 TEXT_FULL_STABLE_FRAMES = 3
 
-# 화면 좌표 보정용:
-# YOLO 박스 중심 x(cx), 박스 하단 y2를 실시간 표시한다.
-# 실제 주행에서 원하는 STATION 타이밍의 cx, y2 값을 확인한 뒤
-# 나중에 그 좌표를 트리거 조건으로 사용할 수 있다.
-
-# YOLO 글씨를 찾은 뒤부터는 도로 중심선 대신
-# 글씨의 중심점을 '가상 중심선'처럼 사용한다.
-# 제자리 회전하지 않고 P제어로 좌우 속도를 조절하면서 전진한다.
-# 글씨 bbox 아래쪽이 화면 높이의 60% 지점에 도달하면
-# DRIVE_TEXT로 상태만 전환하고 같은 방식으로 계속 접근한다.
-# 이 기준선은 화면에는 표시하지 않는다.
 TEXT_ALIGN_TRIGGER_RATIO = 0.60
+TEXT_BOTTOM_TURN_SEC = 0.6
 
-# 글씨 bbox의 가장 아래(y2)가 카메라 화면의 가장 아래에 닿았다고
-# 판단하는 비율. 완전한 1.00은 검출 흔들림 때문에 놓칠 수 있어
-# 화면 높이의 98% 이상이면 '밑부분 도달'로 판단한다.
+STATION_PRE_TURN_FORWARD_SEC = 1.0
+STATION_FORWARD_AFTER_TURN_SEC = 2.0
+
 TEXT_BOTTOM_TRIGGER_RATIO = 0.98
 
-# 글씨가 화면 아래까지 도달한 뒤 동작
 FORWARD_AFTER_TEXT_SEC = 3.0
 STOP_AFTER_TEXT_SEC = 3.0
 
@@ -186,6 +143,20 @@ if not os.path.exists(MODEL_PATH):
 
 print("Loading YOLO model...")
 yolo_model = YOLO(MODEL_PATH)
+
+# YOLO 첫 추론 지연 방지용 워밍업
+try:
+    warmup_img = np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8)
+    yolo_model.predict(
+        warmup_img,
+        imgsz=YOLO_IMGSZ,
+        conf=YOLO_CONF,
+        verbose=False
+    )
+    print("YOLO warm-up done.")
+except Exception as e:
+    print("YOLO warm-up failed:", e)
+
 print("YOLO model loaded.")
 print("YOLO classes:", yolo_model.names)
 
@@ -243,38 +214,14 @@ def zmq_wait_for_start():
 # Motor helpers
 # ============================================================
 def clamp(v, lo=-100, hi=100):
-    return max(
-        lo,
-        min(
-            hi,
-            int(v)
-        )
-    )
+    return max(lo, min(hi, int(v)))
 
 
 def drive(left, right):
-    global last_cmd_left
-    global last_cmd_right
-
-    left_c = clamp(left)
-    right_c = clamp(right)
-
-    last_cmd_left = float(left_c)
-    last_cmd_right = float(right_c)
-
-    motor.move(
-        left_c,
-        right_c
-    )
+    motor.move(clamp(left), clamp(right))
 
 
 def stop_robot():
-    global last_cmd_left
-    global last_cmd_right
-
-    last_cmd_left = 0.0
-    last_cmd_right = 0.0
-
     motor.move(0, 0)
 
 
@@ -290,92 +237,43 @@ def remove_small_components(binary_mask, min_area):
     cleaned = np.zeros_like(binary_mask)
 
     for i in range(1, num_labels):
-        area = stats[
-            i,
-            cv2.CC_STAT_AREA
-        ]
-
+        area = stats[i, cv2.CC_STAT_AREA]
         if area >= min_area:
-            cleaned[
-                labels == i
-            ] = 255
+            cleaned[labels == i] = 255
 
     return cleaned
 
 
 # ============================================================
 # 중심선용 내부 간격 메우기
-#
-# 흰색 도로 사이의 작은 내부 간격은
-# 색과 상관없이 흰색으로 메운다.
-#
-# 따라서:
-# - 검은 화살표 -> 중심선용 road_mask에서 제거
-# - 황토색 박스 -> 흰 도로 내부라면 road_mask에서 흰길처럼 처리
-#
-# 단, 황토색을 도로색 자체로 등록하지 않으므로
-# 도로 바깥 황토색 전체가 길로 잡히지는 않는다.
 # ============================================================
 def fill_road_internal_gaps(white_mask):
     filled = white_mask.copy()
-
     h, w = white_mask.shape
-    max_internal_gap = int(
-        w * INTERNAL_GAP_RATIO
-    )
+    max_internal_gap = int(w * INTERNAL_GAP_RATIO)
 
     for y in range(h):
-        xs = np.where(
-            white_mask[y] == 255
-        )[0]
-
+        xs = np.where(white_mask[y] == 255)[0]
         if len(xs) == 0:
             continue
 
-        groups = np.split(
-            xs,
-            np.where(
-                np.diff(xs) > 1
-            )[0] + 1
-        )
-
-        groups = [
-            g
-            for g in groups
-            if len(g) >= MIN_WIDTH
-        ]
+        groups = np.split(xs, np.where(np.diff(xs) > 1)[0] + 1)
+        groups = [g for g in groups if len(g) >= MIN_WIDTH]
 
         if len(groups) < 2:
             continue
 
-        for i in range(
-            len(groups) - 1
-        ):
+        for i in range(len(groups) - 1):
             left_group = groups[i]
             right_group = groups[i + 1]
 
-            left_end = int(
-                left_group[-1]
-            )
+            left_end = int(left_group[-1])
+            right_start = int(right_group[0])
 
-            right_start = int(
-                right_group[0]
-            )
+            gap = right_start - left_end - 1
 
-            gap = (
-                right_start
-                - left_end
-                - 1
-            )
-
-            if (
-                gap > 0
-                and gap <= max_internal_gap
-            ):
-                filled[
-                    y,
-                    left_end:right_start + 1
-                ] = 255
+            if 0 < gap <= max_internal_gap:
+                filled[y, left_end:right_start + 1] = 255
 
     return filled
 
@@ -383,9 +281,7 @@ def fill_road_internal_gaps(white_mask):
 # ============================================================
 # YOLO STOP / STATION 검출
 # ============================================================
-def detect_text_yolo(frame, y_offset=0):
-    # YOLO는 전달된 ROI 이미지 안에서만 실행한다.
-    # y_offset은 ROI bbox 좌표를 전체 카메라 좌표로 복원할 때 사용한다.
+def detect_text_yolo(frame, y_offset=0, expected_class=None):
     results = yolo_model(
         frame,
         imgsz=YOLO_IMGSZ,
@@ -397,73 +293,38 @@ def detect_text_yolo(frame, y_offset=0):
         return None
 
     r = results[0]
-
     if r.boxes is None:
         return None
 
     candidates = []
 
     for box in r.boxes:
-        cls_id = int(
-            box.cls[0]
-        )
-
-        conf = float(
-            box.conf[0]
-        )
-
-        name = str(
-            yolo_model.names[cls_id]
-        ).upper().strip()
+        cls_id = int(box.cls[0])
+        conf = float(box.conf[0])
+        name = str(yolo_model.names[cls_id]).upper().strip()
 
         if name not in TEXT_CLASSES:
             continue
 
-        x1, y1, x2, y2 = map(
-            int,
-            box.xyxy[0].tolist()
-        )
+        if expected_class is not None and name != expected_class:
+            continue
 
-        # YOLO는 ROI 내부 좌표를 반환하므로
-        # 화면 표시/거리 판단을 위해 전체 프레임 y좌표로 복원한다.
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
         y1_full = y1 + y_offset
         y2_full = y2 + y_offset
 
         candidates.append({
             "type": name,
             "conf": conf,
-            "bbox": (
-                x1,
-                y1_full,
-                x2,
-                y2_full
-            ),
-            "center": (
-                (x1 + x2) // 2,
-                (y1_full + y2_full) // 2
-            )
+            "bbox": (x1, y1_full, x2, y2_full),
+            "center": ((x1 + x2) // 2, (y1_full + y2_full) // 2)
         })
 
     if not candidates:
         return None
 
-    return max(
-        candidates,
-        key=lambda z: z["bbox"][3]
-    )
-
-
-def station_virtual_coordinate_reached():
-    if not STATION_COORD_ENABLED:
-        return False
-
-    th_deg = np.degrees(virtual_theta)
-
-    return (
-        abs(virtual_x - STATION_TARGET_X) <= STATION_X_TOL
-        and abs(virtual_y - STATION_TARGET_Y) <= STATION_Y_TOL
-        and abs(th_deg - STATION_TARGET_TH_DEG) <= STATION_TH_TOL_DEG
-    )
+    return max(candidates, key=lambda z: z["bbox"][3])
 
 
 # ============================================================
@@ -484,13 +345,21 @@ def control_loop():
 
     global auto_start_time
     global initial_25s_done
+    global route_stage
+    global station_align_count
+    global goal_seen_near
+    global goal_missing_since
 
-    global virtual_x
-    global virtual_y
-    global virtual_theta
-    global virtual_last_time
-    global station_coord_triggered
-    global current_text_type
+    def expected_class():
+        if route_stage == "STOP1":
+            return "STOP"
+        if route_stage == "STATION":
+            return "STATION"
+        if route_stage == "STOP2":
+            return "STOP"
+        if route_stage == "GOAL":
+            return "GOAL"
+        return None
 
     while not stop_event.is_set():
 
@@ -501,132 +370,33 @@ def control_loop():
             continue
 
         frame = frame.copy()
-
         h, w = frame.shape[:2]
-
-        # ----------------------------------------------------
-        # 시간 기반 가상좌표 업데이트
-        #
-        # 출발점 = (0, 0)
-        # theta = 0 rad는 시작 당시 로봇 정면 방향
-        # ----------------------------------------------------
-        now_virtual = time.time()
-        dt_virtual = now_virtual - virtual_last_time
-        virtual_last_time = now_virtual
-
-        if dt_virtual > 0.0:
-            avg_cmd = (
-                last_cmd_left
-                + last_cmd_right
-            ) / 2.0
-
-            turn_cmd = (
-                last_cmd_right
-                - last_cmd_left
-            )
-
-            virtual_theta += (
-                turn_cmd
-                * VIRTUAL_TURN_SCALE
-                * dt_virtual
-            )
-
-            virtual_distance = (
-                avg_cmd
-                * VIRTUAL_SPEED_SCALE
-                * dt_virtual
-            )
-
-            virtual_x += (
-                virtual_distance
-                * np.cos(virtual_theta)
-            )
-
-            virtual_y += (
-                virtual_distance
-                * np.sin(virtual_theta)
-            )
 
         # ----------------------------------------------------
         # ROI
         # ----------------------------------------------------
-        roi_start = int(
-            h * ROI_START_RATIO
-        )
-
-        roi = frame[
-            roi_start:h,
-            :
-        ]
-
+        roi_start = int(h * ROI_START_RATIO)
+        roi = frame[roi_start:h, :]
         roi_h, roi_w = roi.shape[:2]
 
         # ----------------------------------------------------
         # HSV / Masks
         # ----------------------------------------------------
-        roi_blur = cv2.GaussianBlur(
-            roi,
-            (5, 5),
-            0
-        )
+        roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
+        hsv = cv2.cvtColor(roi_blur, cv2.COLOR_BGR2HSV)
 
-        hsv = cv2.cvtColor(
-            roi_blur,
-            cv2.COLOR_BGR2HSV
-        )
+        white_mask = cv2.inRange(hsv, LOWER_WHITE, UPPER_WHITE)
+        black_mask = cv2.inRange(hsv, LOWER_BLACK, UPPER_BLACK)
 
-        white_mask = cv2.inRange(
-            hsv,
-            LOWER_WHITE,
-            UPPER_WHITE
-        )
+        kernel_open = np.ones((3, 3), np.uint8)
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
-        black_mask = cv2.inRange(
-            hsv,
-            LOWER_BLACK,
-            UPPER_BLACK
-        )
+        kernel_close = np.ones((7, 7), np.uint8)
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
-        kernel_open = np.ones(
-            (3, 3),
-            np.uint8
-        )
-
-        white_mask = cv2.morphologyEx(
-            white_mask,
-            cv2.MORPH_OPEN,
-            kernel_open,
-            iterations=1
-        )
-
-        black_mask = cv2.morphologyEx(
-            black_mask,
-            cv2.MORPH_OPEN,
-            kernel_open,
-            iterations=1
-        )
-
-        kernel_close = np.ones(
-            (7, 7),
-            np.uint8
-        )
-
-        white_mask = cv2.morphologyEx(
-            white_mask,
-            cv2.MORPH_CLOSE,
-            kernel_close,
-            iterations=1
-        )
-
-        white_mask = remove_small_components(
-            white_mask,
-            MIN_AREA
-        )
-
-        # 중심선용: 내부 화살표/박스 제거
-        road_mask = fill_road_internal_gaps(
-            white_mask
-        )
+        white_mask = remove_small_components(white_mask, MIN_AREA)
+        road_mask = fill_road_internal_gaps(white_mask)
 
         # ----------------------------------------------------
         # 중심선 계산
@@ -634,30 +404,14 @@ def control_loop():
         center_points = []
         prev_center = None
 
-        for y in range(
-            roi_h - 1,
-            0,
-            -STEP
-        ):
-            xs = np.where(
-                road_mask[y] == 255
-            )[0]
+        for y in range(roi_h - 1, 0, -STEP):
+            xs = np.where(road_mask[y] == 255)[0]
 
             if len(xs) == 0:
                 continue
 
-            groups = np.split(
-                xs,
-                np.where(
-                    np.diff(xs) > 1
-                )[0] + 1
-            )
-
-            groups = [
-                g
-                for g in groups
-                if len(g) >= MIN_WIDTH
-            ]
+            groups = np.split(xs, np.where(np.diff(xs) > 1)[0] + 1)
+            groups = [g for g in groups if len(g) >= MIN_WIDTH]
 
             if len(groups) == 0:
                 continue
@@ -665,79 +419,33 @@ def control_loop():
             if prev_center is None:
                 chosen = min(
                     groups,
-                    key=lambda g:
-                    abs(
-                        (
-                            int(g[0])
-                            + int(g[-1])
-                        ) // 2
-                        - roi_w // 2
-                    )
+                    key=lambda g: abs((int(g[0]) + int(g[-1])) // 2 - roi_w // 2)
                 )
-
             else:
                 predicted_x = prev_center
 
                 if len(center_points) >= 2:
                     x1 = center_points[-2][0]
                     x2 = center_points[-1][0]
-
                     dx = x2 - x1
-
-                    dx = int(
-                        np.clip(
-                            dx,
-                            -35,
-                            35
-                        )
-                    )
-
+                    dx = int(np.clip(dx, -35, 35))
                     predicted_x = x2 + dx
 
                 chosen = min(
                     groups,
-                    key=lambda g:
-                    abs(
-                        (
-                            int(g[0])
-                            + int(g[-1])
-                        ) // 2
-                        - predicted_x
-                    )
+                    key=lambda g: abs((int(g[0]) + int(g[-1])) // 2 - predicted_x)
                 )
 
-            x_left = int(
-                chosen[0]
-            )
-
-            x_right = int(
-                chosen[-1]
-            )
-
-            x_center = (
-                x_left
-                + x_right
-            ) // 2
+            x_left = int(chosen[0])
+            x_right = int(chosen[-1])
+            x_center = (x_left + x_right) // 2
 
             if prev_center is not None:
-                if abs(
-                    x_center
-                    - prev_center
-                ) > MAX_JUMP:
+                if abs(x_center - prev_center) > MAX_JUMP:
                     continue
 
-            original_y = (
-                y
-                + roi_start
-            )
-
-            center_points.append(
-                (
-                    x_center,
-                    original_y
-                )
-            )
-
+            original_y = y + roi_start
+            center_points.append((x_center, original_y))
             prev_center = x_center
 
             if len(center_points) >= MAX_POINTS:
@@ -748,58 +456,44 @@ def control_loop():
         error = None
 
         if len(center_points) >= 3:
-            target_x, target_y = (
-                center_points[2]
-            )
+            target_x, target_y = center_points[2]
 
         if target_x is not None:
-            error = (
-                target_x
-                - w // 2
-            )
-
+            error = target_x - w // 2
             last_error = error
 
         # ----------------------------------------------------
-        # YOLO
-        #
-        # 첫 번째 3번째 화살표 이후부터는
-        # 중심선 주행 중에도 다음 STOP/STATION을 계속 찾는다.
+        # YOLO (25초 이후부터 활성화)
         # ----------------------------------------------------
         text_target = None
 
         if (
             initial_25s_done
-            and (
-                drive_state in (
-                    "SEARCH_TEXT",
-                    "APPROACH_TEXT",
-                    "DRIVE_TEXT"
-                )
-                or (
-                    station_coord_triggered
-                    and drive_state == "CENTERLINE"
-                )
+            and drive_state in (
+                "CENTERLINE",
+                "SEARCH_TEXT",
+                "APPROACH_TEXT",
+                "DRIVE_TEXT",
+                "STATION_ALIGN",
+                "STATION_PRE_TURN_FORWARD",
+                "TEXT_BOTTOM_TURN",
+                "GOAL_APPROACH",
+                "GOAL_PASSING"
             )
         ):
             try:
                 text_target = detect_text_yolo(
                     roi,
-                    y_offset=roi_start
+                    y_offset=roi_start,
+                    expected_class=expected_class()
                 )
             except Exception as e:
-                print(
-                    "YOLO ERROR:",
-                    e
-                )
+                print("YOLO ERROR:", e)
 
         # ----------------------------------------------------
         # Manual override
         # ----------------------------------------------------
-        if (
-            time.time() < manual_until
-            and manual_cmd is not None
-        ):
+        if time.time() < manual_until and manual_cmd is not None:
             l, r = manual_cmd
             drive(l, r)
 
@@ -808,183 +502,68 @@ def control_loop():
 
         else:
             # ================================================
-            # CENTERLINE
+            # CENTERLINE (통합 구조)
             # ================================================
             if drive_state == "CENTERLINE":
 
-                # ------------------------------------------------
-                # 최초 AUTO 시작 후 딱 한 번만 25초 중심선 추종
-                # ------------------------------------------------
-                if not initial_25s_done:
+                if auto_start_time is None:
+                    auto_start_time = time.time()
 
-                    if auto_start_time is None:
-                        auto_start_time = time.time()
+                elapsed_centerline = time.time() - auto_start_time
 
-                    elapsed_centerline = (
-                        time.time()
-                        - auto_start_time
-                    )
+                # [이벤트 1] 최초 시작 후 25초 경과 시 정지 후 SEARCH_TEXT로 전환
+                if not initial_25s_done and elapsed_centerline >= CENTERLINE_RUN_SEC:
+                    stop_robot()
+                    initial_25s_done = True
+                    drive_state = "SEARCH_TEXT"
+                    state_start_time = time.time()
 
-                    if elapsed_centerline >= CENTERLINE_RUN_SEC:
-                        stop_robot()
+                    text_full_count = 0
+                    text_candidate_type = None
 
-                        initial_25s_done = True
-                        drive_state = "SEARCH_TEXT"
-                        state_start_time = time.time()
+                    print("[TIMER] first 25s centerline done -> SEARCH_TEXT")
 
-                        text_full_count = 0
-                        text_candidate_type = None
+                # [이벤트 2] 25초 이후 중심선 주행 중 STOP/STATION 글씨 감지 시
+                elif initial_25s_done and text_target is not None:
+                    current_text_type = text_target["type"]
 
-                        print(
-                            "[TIMER] first 25s centerline done -> SEARCH_TEXT"
-                        )
-
-                    elif error is not None:
-                        correction = (
-                            KP * error
-                        )
-
-                        left_speed = (
-                            BASE_SPEED
-                            + correction
-                        )
-
-                        right_speed = (
-                            BASE_SPEED
-                            - correction
-                        )
-
-                        left_speed = int(
-                            np.clip(
-                                left_speed,
-                                0,
-                                MAX_SPEED
-                            )
-                        )
-
-                        right_speed = int(
-                            np.clip(
-                                right_speed,
-                                0,
-                                MAX_SPEED
-                            )
-                        )
-
-                        drive(
-                            left_speed,
-                            right_speed
-                        )
-
+                    if current_text_type == "GOAL":
+                        drive_state = "GOAL_APPROACH"
+                        goal_seen_near = False
+                        goal_missing_since = None
+                        print("[YOLO] GOAL detected -> GOAL_APPROACH")
                     else:
-                        if last_error < 0:
-                            drive(
-                                0,
-                                SEARCH_SPEED
-                            )
-
-                        elif last_error > 0:
-                            drive(
-                                SEARCH_SPEED,
-                                0
-                            )
-
-                        else:
-                            stop_robot()
-
-                # ------------------------------------------------
-                # 최초 25초 과정이 끝난 뒤:
-                #
-                # STOP 이벤트 완료 후에는 중심선 추종.
-                # STATION 가상좌표에 도달하기 전까지도 계속 중심선 추종.
-                #
-                # STATION 좌표 도달:
-                # 정지 -> 오른쪽 0.4초 제자리 회전
-                # -> 2초 직진 -> 3초 정지
-                # -> 다시 중심선 추종
-                #
-                # 이후에는 중심선 추종 중 다음 YOLO 글씨를 인식하면
-                # 기존 글씨 접근/처리 로직을 다시 수행한다.
-                # ------------------------------------------------
-                else:
-
-                    if (
-                        STATION_COORD_ENABLED
-                        and not station_coord_triggered
-                        and station_virtual_coordinate_reached()
-                    ):
-                        station_coord_triggered = True
-                        current_text_type = "STATION_COORD"
-
-                        stop_robot()
-                        state_start_time = time.time()
-                        drive_state = "STATION_COORD_TURN"
-
-                        print(
-                            "[VIRTUAL] STATION coordinate reached "
-                            "-> stop / right turn 0.4s"
-                        )
-
-                    elif (
-                        station_coord_triggered
-                        and text_target is not None
-                    ):
-                        current_text_type = text_target["type"]
                         drive_state = "APPROACH_TEXT"
+                        print(f"[YOLO] {text_target['type']} detected -> APPROACH_TEXT")
 
-                        print(
-                            f"[YOLO] next {text_target['type']} detected "
-                            "after STATION -> APPROACH_TEXT"
+                # [기본 상태] 별도 이벤트가 없으면 무조건 '중심선 추종(PID/검색)'
+                else:
+                    if error is not None:
+                        # 커브 감속 + 안쪽 바퀴 역회전 허용
+                        base = max(
+                            MIN_CURVE_SPEED,
+                            BASE_SPEED - CURVE_SLOWDOWN * abs(error)
                         )
 
-                    elif error is not None:
-                        correction = (
-                            KP * error
-                        )
+                        correction = KP * error
 
-                        left_speed = (
-                            BASE_SPEED
-                            + correction
-                        )
-
-                        right_speed = (
-                            BASE_SPEED
-                            - correction
-                        )
-
-                        left_speed = int(
-                            np.clip(
-                                left_speed,
-                                0,
-                                MAX_SPEED
-                            )
-                        )
-
-                        right_speed = int(
-                            np.clip(
-                                right_speed,
-                                0,
-                                MAX_SPEED
-                            )
-                        )
-
-                        drive(
-                            left_speed,
-                            right_speed
-                        )
+                        left_speed = int(np.clip(
+                            base + correction,
+                            INNER_MIN_SPEED,
+                            MAX_SPEED
+                        ))
+                        right_speed = int(np.clip(
+                            base - correction,
+                            INNER_MIN_SPEED,
+                            MAX_SPEED
+                        ))
+                        drive(left_speed, right_speed)
 
                     else:
                         if last_error < 0:
-                            drive(
-                                0,
-                                SEARCH_SPEED
-                            )
-
+                            drive(SEARCH_INNER_SPEED, SEARCH_SPEED)
                         elif last_error > 0:
-                            drive(
-                                SEARCH_SPEED,
-                                0
-                            )
-
+                            drive(SEARCH_SPEED, SEARCH_INNER_SPEED)
                         else:
                             stop_robot()
 
@@ -996,276 +575,187 @@ def control_loop():
                 full_text_target = None
 
                 if text_target is not None:
-                    x1, y1, x2, y2 = (
-                        text_target["bbox"]
-                    )
+                    x1, y1, x2, y2 = text_target["bbox"]
+                    text_fully_inside = (x1 >= TEXT_FULL_MARGIN and x2 <= (w - TEXT_FULL_MARGIN))
+                    current_type = text_target["type"]
 
-                    text_fully_inside = (
-                        x1 >= TEXT_FULL_MARGIN
-                        and x2 <= (
-                            w
-                            - TEXT_FULL_MARGIN
-                        )
-                    )
-
-                    current_type = (
-                        text_target["type"]
-                    )
-
-                    # 최초 25초 후 SEARCH_TEXT에서는 STOP만 처리한다.
-                    # STATION은 이후 가상좌표로 처리한다.
-                    if current_type != "STOP":
-                        text_full_count = 0
-                        text_candidate_type = None
-                        full_text_target = None
-                        continue_search = True
-                    else:
-                        continue_search = False
-
-                    if (not continue_search) and text_fully_inside:
-                        if (
-                            text_candidate_type
-                            == current_type
-                        ):
+                    if text_fully_inside:
+                        if text_candidate_type == current_type:
                             text_full_count += 1
                         else:
                             text_candidate_type = current_type
                             text_full_count = 1
 
-                        if (
-                            text_full_count
-                            >= TEXT_FULL_STABLE_FRAMES
-                        ):
+                        if text_full_count >= TEXT_FULL_STABLE_FRAMES:
                             full_text_target = text_target
-
                     else:
                         text_full_count = 0
                         text_candidate_type = None
-
                 else:
                     text_full_count = 0
                     text_candidate_type = None
 
                 if full_text_target is not None:
                     stop_robot()
-
                     current_text_type = full_text_target["type"]
-                    drive_state = "APPROACH_TEXT"
 
-                    print(
-                        f"[YOLO] {full_text_target['type']} "
-                        "full -> APPROACH_TEXT"
-                    )
-
+                    if current_text_type == "GOAL":
+                        drive_state = "GOAL_APPROACH"
+                        goal_seen_near = False
+                        goal_missing_since = None
+                        print("[YOLO] GOAL full -> GOAL_APPROACH")
+                    else:
+                        drive_state = "APPROACH_TEXT"
+                        print(f"[YOLO] {full_text_target['type']} full -> APPROACH_TEXT")
                 else:
-                    drive(
-                        TURN_SPEED,
-                        -TURN_SPEED
-                    )
+                    drive(TURN_SPEED, -TURN_SPEED)
 
             # ================================================
             # APPROACH_TEXT
-            #
-            # YOLO 글씨를 인식한 뒤에는 제자리 회전하지 않는다.
-            # 글씨 중심 x좌표를 '가상 중심선'처럼 사용하여
-            # 중심선 추종과 비슷한 P제어 방식으로 전진하면서
-            # 부드럽게 글씨 방향으로 조향한다.
-            #
-            # 글씨 bbox 아래쪽이 화면 높이의 60% 지점까지 내려오면
-            # DRIVE_TEXT로 전환하지만, 주행 방식은 계속
-            # 글씨 x 중심 기준 P제어 전진이다.
             # ================================================
             elif drive_state == "APPROACH_TEXT":
 
                 if text_target is None:
-                    # 글씨를 잠깐 놓치면 급회전하지 않고
-                    # 현재 방향으로 천천히 직진하며 다시 검출을 기다린다.
-                    drive(
-                        TEXT_FOLLOW_SPEED,
-                        TEXT_FOLLOW_SPEED
-                    )
-
+                    drive(TEXT_FOLLOW_SPEED, TEXT_FOLLOW_SPEED)
                 else:
-                    text_x = (
-                        text_target["center"][0]
-                    )
+                    text_x = text_target["center"][0]
+                    _, _, _, text_y2 = text_target["bbox"]
+                    text_error = text_x - w // 2
 
-                    _, _, _, text_y2 = (
-                        text_target["bbox"]
-                    )
-
-                    text_error = (
-                        text_x
-                        - w // 2
-                    )
-
-                    # 글씨 중심을 기준으로 P제어하며 전진
                     corr = np.clip(
-                        TEXT_FOLLOW_KP
-                        * text_error,
+                        TEXT_FOLLOW_KP * text_error,
                         -TEXT_FOLLOW_MAX_CORR,
                         TEXT_FOLLOW_MAX_CORR
                     )
 
-                    drive(
-                        TEXT_FOLLOW_SPEED + corr,
-                        TEXT_FOLLOW_SPEED - corr
-                    )
+                    drive(TEXT_FOLLOW_SPEED + corr, TEXT_FOLLOW_SPEED - corr)
 
-                    # 충분히 가까워지면 DRIVE_TEXT로 상태만 전환.
-                    # 제자리 회전은 하지 않는다.
-                    if (
-                        text_y2
-                        >= int(
-                            h * TEXT_ALIGN_TRIGGER_RATIO
-                        )
-                    ):
+                    if current_text_type == "STATION" and text_y2 >= int(h * STATION_ALIGN_Y_RATIO):
+                        station_align_count = 0
+                        drive_state = "STATION_ALIGN"
+                        print("[STATION] reached alignment zone -> STATION_ALIGN")
+                    elif text_y2 >= int(h * TEXT_ALIGN_TRIGGER_RATIO):
                         drive_state = "DRIVE_TEXT"
-
-                        print(
-                            f"[YOLO] {text_target['type']} reached 60% "
-                            "-> DRIVE_TEXT"
-                        )
+                        print(f"[YOLO] {text_target['type']} reached 60% -> DRIVE_TEXT")
 
             # ================================================
             # DRIVE_TEXT
-            #
-            # 60% 지점에서 정렬이 완료된 뒤:
-            # 글씨 bbox의 x 중심을 따라 계속 전진한다.
-            # 글씨 bbox의 가장 아래쪽(y2)이 카메라 화면의 가장 아래까지
-            # 내려오면 글씨 추종을 끝내고 2초 직진한다.
             # ================================================
             elif drive_state == "DRIVE_TEXT":
 
                 if text_target is not None:
-                    text_x = (
-                        text_target["center"][0]
-                    )
+                    text_x = text_target["center"][0]
+                    _, _, _, text_y2 = text_target["bbox"]
+                    text_error = text_x - w // 2
 
-                    _, _, _, text_y2 = (
-                        text_target["bbox"]
-                    )
-
-                    text_error = (
-                        text_x
-                        - w // 2
-                    )
-
-                    # 글씨 박스 밑부분이 화면 밑부분에 닿으면
-                    # 글씨 추종 종료 -> 2초 직진
-                    if (
-                        text_y2
-                        >= int(
-                            h * TEXT_BOTTOM_TRIGGER_RATIO
-                        )
-                    ):
+                    if text_y2 >= int(h * TEXT_BOTTOM_TRIGGER_RATIO):
                         stop_robot()
                         state_start_time = time.time()
 
-                        drive_state = "FORWARD_2SEC"
-
-                        print(
-                            f"[YOLO] {current_text_type} bbox bottom reached screen bottom "
-                            "-> forward"
-                        )
+                        if current_text_type == "STATION":
+                            drive_state = "STATION_ALIGN"
+                            station_align_count = 0
+                            print("[YOLO] STATION bbox bottom reached -> STATION_ALIGN")
+                        elif current_text_type == "GOAL":
+                            drive_state = "GOAL_PASSING"
+                            goal_seen_near = True
+                            goal_missing_since = None
+                            print("[YOLO] GOAL near -> GOAL_PASSING")
+                        else:
+                            drive_state = "FORWARD_2SEC"
+                            print(f"[YOLO] {current_text_type} bbox bottom reached -> forward 3.0s")
 
                     else:
                         corr = np.clip(
-                            TEXT_FOLLOW_KP
-                            * text_error,
+                            TEXT_FOLLOW_KP * text_error,
                             -TEXT_FOLLOW_MAX_CORR,
                             TEXT_FOLLOW_MAX_CORR
                         )
+                        drive(TEXT_FOLLOW_SPEED + corr, TEXT_FOLLOW_SPEED - corr)
 
+                else:
+                    drive(TEXT_FOLLOW_SPEED, TEXT_FOLLOW_SPEED)
+
+            # ================================================
+            # STATION_ALIGN
+            # STATION을 화면 중앙에 안정적으로 맞춘 뒤 회전
+            # ================================================
+            elif drive_state == "STATION_ALIGN":
+
+                if text_target is None:
+                    # 잠깐 놓쳐도 저속으로 직진하지 않고 정지하여 재검출
+                    stop_robot()
+                    station_align_count = 0
+                else:
+                    text_x = text_target["center"][0]
+                    _, _, _, text_y2 = text_target["bbox"]
+                    align_error = text_x - w // 2
+
+                    if abs(align_error) <= STATION_CENTER_TOL:
+                        station_align_count += 1
+                        drive(TEXT_FOLLOW_SPEED * 0.45, TEXT_FOLLOW_SPEED * 0.45)
+
+                        if station_align_count >= STATION_ALIGN_STABLE_FRAMES:
+                            stop_robot()
+                            state_start_time = time.time()
+                            drive_state = "STATION_PRE_TURN_FORWARD"
+                            print("[STATION] centered and stable -> PRE_TURN_FORWARD")
+                    else:
+                        station_align_count = 0
+                        corr = np.clip(
+                            0.16 * align_error,
+                            -ALIGN_SPEED,
+                            ALIGN_SPEED
+                        )
                         drive(
-                            TEXT_FOLLOW_SPEED + corr,
-                            TEXT_FOLLOW_SPEED - corr
+                            int(TEXT_FOLLOW_SPEED * 0.45 + corr),
+                            int(TEXT_FOLLOW_SPEED * 0.45 - corr)
                         )
 
-                else:
-                    # 글씨가 잠깐 놓쳐도 바로 정지하지 않고
-                    # 기존 방향으로 천천히 직진하며 다시 검출을 기다림
-                    drive(
-                        TEXT_FOLLOW_SPEED,
-                        TEXT_FOLLOW_SPEED
-                    )
-
             # ================================================
-            # STATION_COORD_TURN
-            #
-            # 좌표 도달 즉시 정지한 뒤 오른쪽으로 0.4초 제자리 회전
+            # STATION_PRE_TURN_FORWARD
             # ================================================
-            elif drive_state == "STATION_COORD_TURN":
+            elif drive_state == "STATION_PRE_TURN_FORWARD":
 
-                if (
-                    time.time()
-                    - state_start_time
-                    < STATION_COORD_TURN_SEC
-                ):
-                    drive(
-                        TURN_SPEED,
-                        -TURN_SPEED
-                    )
-
+                if time.time() - state_start_time < STATION_PRE_TURN_FORWARD_SEC:
+                    drive(TEXT_FOLLOW_SPEED, TEXT_FOLLOW_SPEED)
                 else:
                     stop_robot()
                     state_start_time = time.time()
-                    drive_state = "STATION_COORD_FORWARD"
-
-                    print(
-                        "[STATION COORD] right turn 0.4s done "
-                        "-> forward 2.0s"
-                    )
+                    drive_state = "TEXT_BOTTOM_TURN"
+                    print("[STATION] extra forward 1.0s done -> right turn 0.6s")
 
             # ================================================
-            # STATION_COORD_FORWARD
+            # TEXT_BOTTOM_TURN
             # ================================================
-            elif drive_state == "STATION_COORD_FORWARD":
+            elif drive_state == "TEXT_BOTTOM_TURN":
 
-                if (
-                    time.time()
-                    - state_start_time
-                    < STATION_COORD_FORWARD_SEC
-                ):
-                    drive(
-                        TEXT_FOLLOW_SPEED,
-                        TEXT_FOLLOW_SPEED
-                    )
-
+                if time.time() - state_start_time < TEXT_BOTTOM_TURN_SEC:
+                    drive(TURN_SPEED, -TURN_SPEED)
                 else:
                     stop_robot()
                     state_start_time = time.time()
-                    drive_state = "STOP_3SEC"
-
-                    print(
-                        "[STATION COORD] forward 2.0s done "
-                        "-> stop 3.0s"
-                    )
+                    drive_state = "FORWARD_2SEC"
+                    print("[TEXT] right turn 0.6s done -> forward 3.0s")
 
             # ================================================
             # FORWARD_2SEC
             # ================================================
             elif drive_state == "FORWARD_2SEC":
 
-                if (
-                    time.time()
-                    - state_start_time
-                    < FORWARD_AFTER_TEXT_SEC
-                ):
-                    drive(
-                        TEXT_FOLLOW_SPEED,
-                        TEXT_FOLLOW_SPEED
-                    )
+                forward_duration = (
+                    STATION_FORWARD_AFTER_TURN_SEC
+                    if current_text_type == "STATION"
+                    else FORWARD_AFTER_TEXT_SEC
+                )
 
+                if time.time() - state_start_time < forward_duration:
+                    drive(TEXT_FOLLOW_SPEED, TEXT_FOLLOW_SPEED)
                 else:
                     stop_robot()
                     state_start_time = time.time()
                     drive_state = "STOP_3SEC"
-
-                    print(
-                        f"[TEXT] forward {FORWARD_AFTER_TEXT_SEC:.1f}s done "
-                        "-> stop 3.0s"
-                    )
+                    print(f"[TEXT] forward {forward_duration:.1f}s done -> stop 3.0s")
 
             # ================================================
             # STOP_3SEC
@@ -1274,182 +764,165 @@ def control_loop():
 
                 stop_robot()
 
-                if (
-                    time.time()
-                    - state_start_time
-                    >= STOP_AFTER_TEXT_SEC
-                ):
-                    current_text_type = None
-                    drive_state = "CENTERLINE"
+                if time.time() - state_start_time >= STOP_AFTER_TEXT_SEC:
 
-                    print(
-                        "[TEXT] 3s stop done -> CENTERLINE"
+                    # 숫자 stop_count를 사용하지 않고 현재 코스 단계로 구분
+                    if route_stage == "STOP1":
+                        route_stage = "STATION"
+                        current_text_type = None
+                        drive_state = "CENTERLINE"
+                        print("[ROUTE] STOP1 done -> SEARCH STATION")
+
+                    elif route_stage == "STATION":
+                        route_stage = "STOP2"
+                        current_text_type = None
+                        drive_state = "CENTERLINE"
+                        print("[ROUTE] STATION done -> SEARCH STOP2")
+
+                    elif route_stage == "STOP2":
+                        current_text_type = None
+                        state_start_time = time.time()
+                        drive_state = "FINAL_FORWARD"
+                        print("[ROUTE] STOP2 done -> FINAL_FORWARD 3.0s")
+
+                    else:
+                        current_text_type = None
+                        drive_state = "CENTERLINE"
+
+            # ================================================
+            # FINAL_FORWARD
+            # STOP2에서 마지막 우회전 위치까지 직진
+            # ================================================
+            elif drive_state == "FINAL_FORWARD":
+
+                if time.time() - state_start_time < FINAL_STOP_FORWARD_SEC:
+                    drive(TEXT_FOLLOW_SPEED, TEXT_FOLLOW_SPEED)
+                else:
+                    stop_robot()
+                    state_start_time = time.time()
+                    drive_state = "FINAL_RIGHT_TURN"
+                    print(f"[ROUTE] final forward {FINAL_STOP_FORWARD_SEC:.1f}s done -> big right turn")
+
+            # ================================================
+            # FINAL_RIGHT_TURN
+            # 큰 오른쪽 회전. 90도는 시간으로 근사
+            # ================================================
+            elif drive_state == "FINAL_RIGHT_TURN":
+
+                if time.time() - state_start_time < FINAL_RIGHT_TURN_SEC:
+                    drive(TURN_SPEED, -TURN_SPEED)
+                else:
+                    stop_robot()
+                    state_start_time = time.time()
+                    route_stage = "GOAL"
+                    drive_state = "CENTERLINE"
+                    print("[ROUTE] final right turn done -> CENTERLINE / SEARCH GOAL")
+
+            # ================================================
+            # GOAL_APPROACH
+            # GOAL 중심을 따라 접근
+            # ================================================
+            elif drive_state == "GOAL_APPROACH":
+
+                if text_target is None:
+                    # GOAL이 잠깐 놓치면 바로 정지하지 않고 마지막 방향으로 저속 직진
+                    drive(TEXT_FOLLOW_SPEED * 0.75, TEXT_FOLLOW_SPEED * 0.75)
+                else:
+                    text_x = text_target["center"][0]
+                    _, _, _, text_y2 = text_target["bbox"]
+                    text_error = text_x - w // 2
+
+                    corr = np.clip(
+                        TEXT_FOLLOW_KP * text_error,
+                        -TEXT_FOLLOW_MAX_CORR,
+                        TEXT_FOLLOW_MAX_CORR
                     )
+                    drive(
+                        TEXT_FOLLOW_SPEED + corr,
+                        TEXT_FOLLOW_SPEED - corr
+                    )
+
+                    if text_y2 >= int(h * GOAL_NEAR_RATIO):
+                        goal_seen_near = True
+                        goal_missing_since = None
+                        drive_state = "GOAL_PASSING"
+                        print("[GOAL] near -> GOAL_PASSING")
+
+            # ================================================
+            # GOAL_PASSING
+            # GOAL이 화면에서 사라질 때까지 직진
+            # ================================================
+            elif drive_state == "GOAL_PASSING":
+
+                if text_target is not None:
+                    goal_missing_since = None
+
+                    text_x = text_target["center"][0]
+                    text_error = text_x - w // 2
+
+                    corr = np.clip(
+                        TEXT_FOLLOW_KP * text_error,
+                        -TEXT_FOLLOW_MAX_CORR,
+                        TEXT_FOLLOW_MAX_CORR
+                    )
+                    drive(
+                        TEXT_FOLLOW_SPEED + corr,
+                        TEXT_FOLLOW_SPEED - corr
+                    )
+                else:
+                    if goal_missing_since is None:
+                        goal_missing_since = time.time()
+
+                    drive(TEXT_FOLLOW_SPEED * 0.65, TEXT_FOLLOW_SPEED * 0.65)
+
+                    if (
+                        goal_seen_near
+                        and time.time() - goal_missing_since >= GOAL_MISS_TIMEOUT
+                    ):
+                        stop_robot()
+                        route_stage = "DONE"
+                        drive_state = "DONE"
+                        auto_mode = False
+                        print("[GOAL] disappeared -> ROBOT STOP / DONE")
+
+            # ================================================
+            # DONE
+            # ================================================
+            elif drive_state == "DONE":
+                stop_robot()
 
         # ----------------------------------------------------
         # 화면 표시
         # ----------------------------------------------------
         result = frame.copy()
 
-        cv2.line(
-            result,
-            (0, roi_start),
-            (w, roi_start),
-            (0, 255, 255),
-            2
-        )
-
-        cv2.line(
-            result,
-            (w // 2, roi_start),
-            (w // 2, h),
-            (0, 255, 0),
-            2
-        )
+        cv2.line(result, (0, roi_start), (w, roi_start), (0, 255, 255), 2)
+        cv2.line(result, (w // 2, roi_start), (w // 2, h), (0, 255, 0), 2)
 
         for x, y in center_points:
-            cv2.circle(
-                result,
-                (x, y),
-                4,
-                (0, 0, 255),
-                -1
-            )
+            cv2.circle(result, (x, y), 4, (0, 0, 255), -1)
 
-        for i in range(
-            len(center_points) - 1
-        ):
-            cv2.line(
-                result,
-                center_points[i],
-                center_points[i + 1],
-                (255, 0, 0),
-                3
-            )
+        for i in range(len(center_points) - 1):
+            cv2.line(result, center_points[i], center_points[i + 1], (255, 0, 0), 3)
 
         if target_x is not None:
-            cv2.circle(
-                result,
-                (
-                    int(target_x),
-                    int(target_y)
-                ),
-                9,
-                (0, 255, 255),
-                -1
-            )
+            cv2.circle(result, (int(target_x), int(target_y)), 9, (0, 255, 255), -1)
 
         if text_target is not None:
-            x1, y1, x2, y2 = (
-                text_target["bbox"]
-            )
-
-            text_cx = (
-                x1 + x2
-            ) // 2
-            text_cy = (
-                y1 + y2
-            ) // 2
-
-            cv2.rectangle(
-                result,
-                (x1, y1),
-                (x2, y2),
-                (255, 0, 255),
-                2
-            )
-
+            x1, y1, x2, y2 = text_target["bbox"]
+            cv2.rectangle(result, (x1, y1), (x2, y2), (255, 0, 255), 2)
             cv2.putText(
                 result,
                 f"{text_target['type']} {text_target['conf']:.2f}",
-                (
-                    x1,
-                    max(
-                        20,
-                        y1 - 8
-                    )
-                ),
+                (x1, max(20, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
                 (255, 0, 255),
                 2
             )
+            cv2.circle(result, text_target["center"], 7, (0, 0, 255), -1)
 
-            cv2.circle(
-                result,
-                text_target["center"],
-                7,
-                (0, 0, 255),
-                -1
-            )
-
-            cv2.putText(
-                result,
-                f"CX:{text_cx}  Y2:{y2}",
-                (
-                    x1,
-                    min(
-                        h - 10,
-                        y2 + 22
-                    )
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                (255, 255, 0),
-                2
-            )
-
-        # ----------------------------------------------------
-        # YOLO 좌표 고정 HUD
-        #
-        # 좌표 기준:
-        # (0, 0) = 전체 카메라 화면의 왼쪽 위
-        # x는 오른쪽으로 증가
-        # y는 아래쪽으로 증가
-        #
-        # YOLO는 아래 50% ROI에서 실행하지만,
-        # y_offset을 더해 전체 화면 기준 Y좌표로 표시한다.
-        # ----------------------------------------------------
-        if text_target is not None:
-            tx1, ty1, tx2, ty2 = text_target["bbox"]
-            tcx = (tx1 + tx2) // 2
-
-            cv2.putText(
-                result,
-                f"YOLO {text_target['type']}  CX:{tcx}  Y2:{ty2}",
-                (12, 135),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (0, 255, 255),
-                2
-            )
-        else:
-            cv2.putText(
-                result,
-                "YOLO: NOT DETECTED",
-                (12, 135),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (0, 255, 255),
-                2
-            )
-
-        # 가상좌표 HUD
-        cv2.putText(
-            result,
-            f"VIRTUAL X:{virtual_x:.2f}  Y:{virtual_y:.2f}  TH:{np.degrees(virtual_theta):.1f}",
-            (12, 162),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 255),
-            2
-        )
-
-        shown_state = (
-            drive_state
-            if auto_mode
-            else f"PAUSED / {drive_state}"
-        )
+        shown_state = drive_state if auto_mode else f"PAUSED / {drive_state}"
 
         cv2.putText(
             result,
@@ -1461,20 +934,24 @@ def control_loop():
             2
         )
 
+        cv2.putText(
+            result,
+            f"ROUTE: {route_stage}",
+            (12, 52),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (255, 255, 0),
+            2
+        )
+
         if (
             auto_mode
             and drive_state == "CENTERLINE"
             and not initial_25s_done
             and auto_start_time is not None
         ):
-            elapsed_show = min(
-                CENTERLINE_RUN_SEC,
-                time.time() - auto_start_time
-            )
-            remain_show = max(
-                0.0,
-                CENTERLINE_RUN_SEC - elapsed_show
-            )
+            elapsed_show = min(CENTERLINE_RUN_SEC, time.time() - auto_start_time)
+            remain_show = max(0.0, CENTERLINE_RUN_SEC - elapsed_show)
             cv2.putText(
                 result,
                 f"CENTERLINE TIMER: {remain_show:.1f}s",
@@ -1485,40 +962,12 @@ def control_loop():
                 2
             )
 
+        road_bgr = cv2.cvtColor(road_mask, cv2.COLOR_GRAY2BGR)
+        road_bgr = cv2.resize(road_bgr, (result.shape[1], result.shape[0]), interpolation=cv2.INTER_NEAREST)
 
+        combo = np.hstack([result, road_bgr])
 
-        # 오른쪽에 중심선용 road_mask 표시
-        road_bgr = cv2.cvtColor(
-            road_mask,
-            cv2.COLOR_GRAY2BGR
-        )
-
-        road_bgr = cv2.resize(
-            road_bgr,
-            (
-                result.shape[1],
-                result.shape[0]
-            ),
-            interpolation=cv2.INTER_NEAREST
-        )
-
-        combo = np.hstack(
-            [
-                result,
-                road_bgr
-            ]
-        )
-
-        ok, jpg = cv2.imencode(
-            ".jpg",
-            combo,
-            [
-                int(
-                    cv2.IMWRITE_JPEG_QUALITY
-                ),
-                JPEG_QUALITY
-            ]
-        )
+        ok, jpg = cv2.imencode(".jpg", combo, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
 
         if ok:
             with jpeg_lock:
@@ -1535,7 +984,7 @@ HTML = """
 <html>
 <head>
 <meta charset="utf-8">
-<title>Pinky Centerline + YOLO</title>
+<title>Pinky Centerline + YOLO Route</title>
 <style>
 body{
     background:#111;
@@ -1557,7 +1006,7 @@ button{
 </head>
 <body>
 
-<h2>Pinky 25s Centerline + YOLO Text Stop</h2>
+<h2>Pinky Centerline + YOLO STOP / STATION / GOAL</h2>
 
 <img src="/video_feed">
 
@@ -1603,9 +1052,7 @@ document.addEventListener(
 
 @app.route("/")
 def index():
-    return render_template_string(
-        HTML
-    )
+    return render_template_string(HTML)
 
 
 def mjpeg():
@@ -1628,10 +1075,7 @@ def mjpeg():
 def video_feed():
     return Response(
         mjpeg(),
-        mimetype=(
-            'multipart/x-mixed-replace; '
-            'boundary=frame'
-        )
+        mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
 
@@ -1647,16 +1091,13 @@ def command(key):
 
     global auto_start_time
     global initial_25s_done
+    global route_stage
+    global station_align_count
+    global goal_seen_near
+    global goal_missing_since
 
     global last_error
     global state_start_time
-
-    global virtual_x
-    global virtual_y
-    global virtual_theta
-    global virtual_last_time
-    global station_coord_triggered
-    global current_text_type
 
     if key == "p":
         auto_mode = not auto_mode
@@ -1682,15 +1123,10 @@ def command(key):
 
         auto_start_time = None
         initial_25s_done = False
-
-        # 가상좌표도 출발점으로 초기화
-        virtual_x = 0.0
-        virtual_y = 0.0
-        virtual_theta = 0.0
-        virtual_last_time = time.time()
-
-        station_coord_triggered = False
-        current_text_type = None
+        route_stage = "STOP1"
+        station_align_count = 0
+        goal_seen_near = False
+        goal_missing_since = None
 
         text_full_count = 0
         text_candidate_type = None
@@ -1705,44 +1141,20 @@ def command(key):
         stop_robot()
 
     elif key == "w":
-        manual_cmd = (
-            MANUAL_SPEED,
-            MANUAL_SPEED
-        )
-        manual_until = (
-            time.time()
-            + MANUAL_PULSE
-        )
+        manual_cmd = (MANUAL_SPEED, MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
 
     elif key == "s":
-        manual_cmd = (
-            -MANUAL_SPEED,
-            -MANUAL_SPEED
-        )
-        manual_until = (
-            time.time()
-            + MANUAL_PULSE
-        )
+        manual_cmd = (-MANUAL_SPEED, -MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
 
     elif key == "a":
-        manual_cmd = (
-            -MANUAL_SPEED,
-            MANUAL_SPEED
-        )
-        manual_until = (
-            time.time()
-            + MANUAL_PULSE
-        )
+        manual_cmd = (-MANUAL_SPEED, MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
 
     elif key == "d":
-        manual_cmd = (
-            MANUAL_SPEED,
-            -MANUAL_SPEED
-        )
-        manual_until = (
-            time.time()
-            + MANUAL_PULSE
-        )
+        manual_cmd = (MANUAL_SPEED, -MANUAL_SPEED)
+        manual_until = time.time() + MANUAL_PULSE
 
     return "OK"
 
