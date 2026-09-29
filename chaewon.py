@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+from collections import deque
 import threading
 import os
 import json
@@ -129,7 +130,7 @@ NEXT_STAGE = {"STOP1": "STATION", "STATION": "STOP2"}
 
 # YOLO를 돌리는 주행 상태
 YOLO_STATES = {
-    "CENTERLINE", "SEARCH_TEXT", "TEXT_SEEK_FULL",
+    "CENTERLINE", "SEARCH_TEXT", "TEXT_SEEK_FULL", "STATION_TURN_SEARCH",
     "APPROACH_TEXT", "DRIVE_TEXT", "GOAL_APPROACH",
 }
 
@@ -150,21 +151,30 @@ EVENT2_STRICT_STAGES = {"STOP2"}
 # ★ [조정용] 글자 전체 확인 (SEARCH_TEXT / TEXT_SEEK_FULL 공통)
 FULL_MARGIN = 20           # 박스 좌우가 화면 끝에서 이 픽셀 이상 떨어져야 "전체 보임"
                            # (다시 STATIO에서 출발하면 30~35로 올릴 것)
-FULL_STABLE_FRAMES = 2     # (SEARCH_TEXT용) 전체 보임이 연속 몇 프레임 유지돼야 출발할지
+FULL_STABLE_FRAMES = 2     # 전체 보임이 연속 몇 프레임 유지돼야 출발할지
+SEEK_TURN_SPEED = 14       # 찾기 회전 속도
+SEEK_PULSE_ON = 0.12       # 회전 펄스: 이만큼 돌고
+SEEK_PULSE_OFF = 0.15      #            이만큼 멈춰서 YOLO가 다시 보게 함
+SEEK_LOST_TIMEOUT = 3.0    # 이 시간 이상 못 보면 중심선 추종으로 복귀
 
 # ============================================================
-# ★★★ [조정용] 고개 돌리기 (TEXT_SEEK_FULL: 글자가 잘려 보일 때 회전 정렬) ★★★
-# 한 번에: SEEK_TURN_SPEED 속도로 SEEK_PULSE_ON 초 돌고 -> 멈춤 -> YOLO로 다시 확인
-#   더 빨리 찾게 하려면 : SEEK_PULSE_ON 을 0.20 -> 0.25 로 (한 번에 더 많이 돔)
-#   글자를 지나쳐 버리면 : SEEK_PULSE_ON 을 0.15 로 줄이기
-#   회전이 약해서 안 돌면: SEEK_TURN_SPEED 를 18 -> 20 으로
+# ★★★ [조정용] STATION 앞 "도로 좁아짐" 감지 -> 멈추고 오른쪽으로 돌려 STATION 찾기 ★★★
+# STOP1 이후 STATION 찾는 구간에서만 동작
+#   흰 도로 폭이 평소보다 갑자기 좁아지고 + 중심선이 옆으로 쏠리면
+#   -> 멈춤 -> 오른쪽으로 조금씩 돌며 STATION 박스 찾기 -> 찾으면 기존 정렬(TEXT_SEEK_FULL)
+# (YOLO가 주행 중에 먼저 STATION을 잡으면 기존 방식대로 처리)
+#
+# 화면 STATION 구간에 "ROAD W / BASE / NARROW" 가 표시되니 그 숫자를 보고 조정할 것
 # ============================================================
-SEEK_TURN_SPEED = 18       # 고개 돌리는 속도 (이전 14)
-SEEK_PULSE_ON = 0.20       # 한 번에 도는 시간(초) (이전 0.12)
-SEEK_SETTLE = 0.05         # 돌고 나서 카메라 흔들림이 멎을 때까지 잠깐 대기(초)
-SEEK_STABLE_FRAMES = 1     # 멈춘 뒤 글자 전체가 몇 프레임 보이면 출발 (이전 2)
-                           # 다시 STATIO 에서 출발하면 2로 올릴 것
-SEEK_LOST_TIMEOUT = 3.0    # 이 시간 이상 못 보면 중심선 추종으로 복귀
+NARROW_RATIO = 0.60          # 도로 폭이 평소(BASE)의 60% 아래로 줄면 "좁아짐"
+                             #   너무 자주 멈추면 0.50, 안 멈추면 0.70
+NARROW_SIDE_ERR = 35         # 중심선 오차가 이 픽셀 이상 옆으로 쏠려야 함
+                             #   0 으로 하면 폭만 보고 판단
+NARROW_CONFIRM_FRAMES = 2    # 좁아짐이 연속 몇 프레임이어야 멈출지
+NARROW_ARM_SEC = 2.0         # STOP1 끝나고 이 시간 동안은 감지 안 함 (평소 폭 학습 시간)
+NARROW_BASE_FRAMES = 15      # 평소 폭(BASE)을 최근 몇 프레임의 중간값으로 잡을지
+STATION_TURN_SEARCH_MAX_SEC = 5.0   # 오른쪽으로 돌며 찾는 최대 시간 -> 못 찾으면 중심선 복귀
+NARROW_COOLDOWN_SEC = 3.0    # 못 찾고 복귀한 뒤 이 시간 동안은 다시 감지 안 함
 
 # 글씨 접근 / 정지
 TEXT_ALIGN_TRIGGER_RATIO = 0.60
@@ -256,6 +266,14 @@ class State:
 
         self.goal_seen_near = False
         self.goal_last_seen = None
+
+        # STATION 앞 도로 좁아짐 감지
+        self.road_w = None
+        self.road_w_hist = deque(maxlen=NARROW_BASE_FRAMES)
+        self.narrow_hits = 0
+        self.narrow_trigger = False
+        self.station_leg_start = None
+        self.narrow_cooldown_until = 0.0
 
         self.exit_err = None            # 출구 구간 평활화된 오차
         self.exit_lost_since = None
@@ -388,13 +406,11 @@ def seek_turn_dir(target, w):
 
 
 def seek_pulse(direction):
-    """정확히 SEEK_PULSE_ON 초만 돌고 멈춤.
-    이전 방식은 YOLO가 느려서(한 프레임 0.3~0.5초) 도는 시간이 들쭉날쭉하고
-    멈춰서 기다리는 시간이 낭비됐음 -> 이제는 돌고 멈춘 직후 바로 YOLO가 봄"""
-    drive(direction * SEEK_TURN_SPEED, -direction * SEEK_TURN_SPEED)
-    time.sleep(SEEK_PULSE_ON)
-    stop_robot()
-    time.sleep(SEEK_SETTLE)
+    """조금 돌고 잠깐 멈추는 펄스 회전 (YOLO 지연 때문에 지나치지 않게)"""
+    if state_elapsed() % (SEEK_PULSE_ON + SEEK_PULSE_OFF) < SEEK_PULSE_ON:
+        drive(direction * SEEK_TURN_SPEED, -direction * SEEK_TURN_SPEED)
+    else:
+        stop_robot()
 
 
 # ============================================================
@@ -569,6 +585,46 @@ def start_text_seek(target, w):
     enter("TEXT_SEEK_FULL", f"[YOLO] {S.current_text_type} detected -> TEXT_SEEK_FULL")
 
 
+def road_width_base():
+    return float(np.median(S.road_w_hist)) if len(S.road_w_hist) >= 3 else None
+
+
+def update_station_narrow(half_widths, error):
+    """STATION 찾는 구간에서 흰 도로 폭이 갑자기 좁아지고 중심선이 옆으로 쏠리는지 확인"""
+    S.narrow_trigger = False
+    S.road_w = 2 * float(np.mean(half_widths[:3])) if len(half_widths) >= 3 else None
+
+    active = (S.auto_mode and S.initial_25s_done
+              and S.route_stage == "STATION" and S.drive_state == "CENTERLINE")
+    if not active:
+        S.station_leg_start = None
+        S.road_w_hist.clear()
+        S.narrow_hits = 0
+        return
+
+    now = time.time()
+    if S.station_leg_start is None:
+        S.station_leg_start = now
+    if S.road_w is None:
+        return
+
+    base = road_width_base()
+    narrow = base is not None and S.road_w < base * NARROW_RATIO
+    side = error is not None and abs(error) >= NARROW_SIDE_ERR
+    armed = (now - S.station_leg_start >= NARROW_ARM_SEC
+             and now >= S.narrow_cooldown_until)
+
+    if narrow and side and armed:
+        S.narrow_hits += 1
+    else:
+        S.narrow_hits = 0
+
+    if not narrow:
+        S.road_w_hist.append(S.road_w)   # 평소 폭은 좁아지지 않은 프레임으로만 학습
+
+    S.narrow_trigger = S.narrow_hits >= NARROW_CONFIRM_FRAMES
+
+
 def back_to_centerline(msg=None):
     S.current_text_type = None
     enter("CENTERLINE", msg)
@@ -607,6 +663,14 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
             else:
                 start_text_seek(t, w)
 
+        # [STATION 앞] 흰 도로가 갑자기 좁아지고 중심선이 옆으로 쏠림 -> 멈추고 오른쪽으로 돌며 찾기
+        elif S.narrow_trigger:
+            stop_robot()
+            S.narrow_hits = 0
+            S.current_text_type = "STATION"
+            enter("STATION_TURN_SEARCH",
+                  f"[STATION] road narrowed (W {S.road_w:.0f} / BASE {road_width_base():.0f}) -> stop, turn right to find STATION")
+
         # [이벤트 3] STATION 이후: 우측 오프셋 중심선
         elif S.route_stage in RIGHT_OFFSET_STAGES:
             follow_centerline(offset_error)
@@ -619,6 +683,19 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
         else:
             follow_centerline(error)
 
+    # ---------------- STATION_TURN_SEARCH: 오른쪽으로 조금씩 돌며 STATION 박스 찾기 ----------------
+    elif st == "STATION_TURN_SEARCH":
+        if t is not None:
+            # 찾음 -> 기존 정렬 과정 그대로 (잘렸으면 잘린 쪽으로 정렬, 전체면 접근)
+            S.current_text_type = "STATION"
+            start_text_seek(t, w)
+        elif state_elapsed() >= STATION_TURN_SEARCH_MAX_SEC:
+            stop_robot()
+            S.narrow_cooldown_until = time.time() + NARROW_COOLDOWN_SEC
+            back_to_centerline(f"[STATION] not found in {STATION_TURN_SEARCH_MAX_SEC:.1f}s -> back to CENTERLINE")
+        else:
+            seek_pulse(1)   # 오른쪽
+
     # ---------------- TEXT_SEEK_FULL (STOP / STATION) ----------------
     elif st == "TEXT_SEEK_FULL":
         if t is not None:
@@ -626,7 +703,7 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
             if fully_visible(t, w):
                 stop_robot()
                 S.text_full_count += 1
-                if S.text_full_count >= SEEK_STABLE_FRAMES:
+                if S.text_full_count >= FULL_STABLE_FRAMES:
                     S.text_full_count = 0
                     enter("APPROACH_TEXT", f"[YOLO] {S.current_text_type} all letters visible -> APPROACH_TEXT")
             else:
@@ -814,6 +891,14 @@ def render(frame, roi_start, road_mask, center_points, target, offset_points, of
     put(img, f"STATE: {shown_state}", (12, 28), YELLOW, 0.60)
     put(img, f"ROUTE: {S.route_stage}", (12, 52), CYAN)
 
+    # ★ STATION 구간: 도로 폭 / 평소 폭 / 좁아짐 카운트 (조정할 때 보는 숫자)
+    if S.route_stage == "STATION":
+        base = road_width_base()
+        rw = f"{S.road_w:.0f}" if S.road_w is not None else "-"
+        bs = f"{base:.0f}" if base is not None else "-"
+        put(img, f"ROAD W {rw} / BASE {bs} (x{NARROW_RATIO:.2f})  NARROW {S.narrow_hits}",
+            (12, 100), ORANGE)
+
     if (S.auto_mode and S.drive_state == "CENTERLINE"
             and not S.initial_25s_done and S.auto_start_time is not None):
         remain = max(0.0, CENTERLINE_RUN_SEC - (time.time() - S.auto_start_time))
@@ -847,6 +932,9 @@ def control_loop():
         target, error = pick_target(center_points, w)
         if error is not None:
             S.last_error = error
+
+        # STATION 앞 도로 좁아짐 감지
+        update_station_narrow(half_widths, error)
 
         # 우측 오프셋 중심선: 오프셋 = RATIO x 도로 반폭
         offset_points = [
