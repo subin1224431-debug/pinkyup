@@ -76,7 +76,7 @@ INTERNAL_GAP_RATIO = 0.30
 # ★ [조정용] STATION 이후 우측 오프셋 중심선 (화면에 주황색 선)
 #   0.0 = 도로 정중앙, 1.0 = 도로 오른쪽 가장자리, 음수 = 왼쪽
 # ============================================================
-CENTERLINE_RIGHT_OFFSET_RATIO = 0.10
+CENTERLINE_RIGHT_OFFSET_RATIO = 0.15
 RIGHT_OFFSET_STAGES = {"STOP2"}
 
 # ============================================================
@@ -150,10 +150,20 @@ EVENT2_STRICT_STAGES = {"STOP2"}
 # ★ [조정용] 글자 전체 확인 (SEARCH_TEXT / TEXT_SEEK_FULL 공통)
 FULL_MARGIN = 20           # 박스 좌우가 화면 끝에서 이 픽셀 이상 떨어져야 "전체 보임"
                            # (다시 STATIO에서 출발하면 30~35로 올릴 것)
-FULL_STABLE_FRAMES = 2     # 전체 보임이 연속 몇 프레임 유지돼야 출발할지
-SEEK_TURN_SPEED = 14       # 찾기 회전 속도
-SEEK_PULSE_ON = 0.12       # 회전 펄스: 이만큼 돌고
-SEEK_PULSE_OFF = 0.15      #            이만큼 멈춰서 YOLO가 다시 보게 함
+FULL_STABLE_FRAMES = 2     # (SEARCH_TEXT용) 전체 보임이 연속 몇 프레임 유지돼야 출발할지
+
+# ============================================================
+# ★★★ [조정용] 고개 돌리기 (TEXT_SEEK_FULL: 글자가 잘려 보일 때 회전 정렬) ★★★
+# 한 번에: SEEK_TURN_SPEED 속도로 SEEK_PULSE_ON 초 돌고 -> 멈춤 -> YOLO로 다시 확인
+#   더 빨리 찾게 하려면 : SEEK_PULSE_ON 을 0.20 -> 0.25 로 (한 번에 더 많이 돔)
+#   글자를 지나쳐 버리면 : SEEK_PULSE_ON 을 0.15 로 줄이기
+#   회전이 약해서 안 돌면: SEEK_TURN_SPEED 를 18 -> 20 으로
+# ============================================================
+SEEK_TURN_SPEED = 18       # 고개 돌리는 속도 (이전 14)
+SEEK_PULSE_ON = 0.20       # 한 번에 도는 시간(초) (이전 0.12)
+SEEK_SETTLE = 0.05         # 돌고 나서 카메라 흔들림이 멎을 때까지 잠깐 대기(초)
+SEEK_STABLE_FRAMES = 1     # 멈춘 뒤 글자 전체가 몇 프레임 보이면 출발 (이전 2)
+                           # 다시 STATIO 에서 출발하면 2로 올릴 것
 SEEK_LOST_TIMEOUT = 3.0    # 이 시간 이상 못 보면 중심선 추종으로 복귀
 
 # 글씨 접근 / 정지
@@ -378,11 +388,13 @@ def seek_turn_dir(target, w):
 
 
 def seek_pulse(direction):
-    """조금 돌고 잠깐 멈추는 펄스 회전 (YOLO 지연 때문에 지나치지 않게)"""
-    if state_elapsed() % (SEEK_PULSE_ON + SEEK_PULSE_OFF) < SEEK_PULSE_ON:
-        drive(direction * SEEK_TURN_SPEED, -direction * SEEK_TURN_SPEED)
-    else:
-        stop_robot()
+    """정확히 SEEK_PULSE_ON 초만 돌고 멈춤.
+    이전 방식은 YOLO가 느려서(한 프레임 0.3~0.5초) 도는 시간이 들쭉날쭉하고
+    멈춰서 기다리는 시간이 낭비됐음 -> 이제는 돌고 멈춘 직후 바로 YOLO가 봄"""
+    drive(direction * SEEK_TURN_SPEED, -direction * SEEK_TURN_SPEED)
+    time.sleep(SEEK_PULSE_ON)
+    stop_robot()
+    time.sleep(SEEK_SETTLE)
 
 
 # ============================================================
@@ -614,7 +626,7 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
             if fully_visible(t, w):
                 stop_robot()
                 S.text_full_count += 1
-                if S.text_full_count >= FULL_STABLE_FRAMES:
+                if S.text_full_count >= SEEK_STABLE_FRAMES:
                     S.text_full_count = 0
                     enter("APPROACH_TEXT", f"[YOLO] {S.current_text_type} all letters visible -> APPROACH_TEXT")
             else:
