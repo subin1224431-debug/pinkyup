@@ -61,7 +61,7 @@ JPEG_QUALITY = 55
 # ============================================================
 # ROI / HSV / 중심선 검출
 # ============================================================
-ROI_START_RATIO = 0.50
+ROI_START_RATIO = 0.40
 
 LOWER_WHITE = np.array([0, 0, 175], dtype=np.uint8)
 UPPER_WHITE = np.array([180, 75, 255], dtype=np.uint8)
@@ -171,6 +171,8 @@ NARROW_RATIO = 0.60          # 도로 폭이 평소(BASE)의 60% 아래로 줄�
 NARROW_SIDE_ERR = 35         # 중심선 오차가 이 픽셀 이상 옆으로 쏠려야 함
                              #   0 으로 하면 폭만 보고 판단
 NARROW_CONFIRM_FRAMES = 2    # 좁아짐이 연속 몇 프레임이어야 멈출지
+NARROW_FORWARD_SEC = 0.7     # ★ 좁아짐 감지 후 이 시간만큼 더 직진하고 멈춤 (0 이면 바로 멈춤)
+NARROW_FORWARD_SPEED = 16    #   그때 직진 속도
 NARROW_ARM_SEC = 2.0         # STOP1 끝나고 이 시간 동안은 감지 안 함 (평소 폭 학습 시간)
 NARROW_BASE_FRAMES = 15      # 평소 폭(BASE)을 최근 몇 프레임의 중간값으로 잡을지
 STATION_TURN_SEARCH_MAX_SEC = 5.0   # 오른쪽으로 돌며 찾는 최대 시간 -> 못 찾으면 중심선 복귀
@@ -665,11 +667,10 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
 
         # [STATION 앞] 흰 도로가 갑자기 좁아지고 중심선이 옆으로 쏠림 -> 멈추고 오른쪽으로 돌며 찾기
         elif S.narrow_trigger:
-            stop_robot()
             S.narrow_hits = 0
             S.current_text_type = "STATION"
-            enter("STATION_TURN_SEARCH",
-                  f"[STATION] road narrowed (W {S.road_w:.0f} / BASE {road_width_base():.0f}) -> stop, turn right to find STATION")
+            enter("STATION_NARROW_FORWARD",
+                  f"[STATION] road narrowed (W {S.road_w:.0f} / BASE {road_width_base():.0f}) -> forward {NARROW_FORWARD_SEC:.1f}s more")
 
         # [이벤트 3] STATION 이후: 우측 오프셋 중심선
         elif S.route_stage in RIGHT_OFFSET_STAGES:
@@ -682,6 +683,14 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
         # [기본] 도로 중심선
         else:
             follow_centerline(error)
+
+    # ---------------- STATION_NARROW_FORWARD: 좁아짐 감지 후 조금 더 직진 -> 멈춤 ----------------
+    elif st == "STATION_NARROW_FORWARD":
+        if state_elapsed() < NARROW_FORWARD_SEC:
+            drive(NARROW_FORWARD_SPEED, NARROW_FORWARD_SPEED)
+        else:
+            stop_robot()
+            enter("STATION_TURN_SEARCH", "[STATION] forward done -> stop, turn right to find STATION")
 
     # ---------------- STATION_TURN_SEARCH: 오른쪽으로 조금씩 돌며 STATION 박스 찾기 ----------------
     elif st == "STATION_TURN_SEARCH":
