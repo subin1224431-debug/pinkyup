@@ -199,7 +199,7 @@ FINAL_RIGHT_TURN_SEC = FINAL_TURN_DEG / TURN_DEG_PER_SEC   # 120도 -> 약 1.35�
 GOAL_NEAR_RATIO = 0.70         # 박스 하단이 화면 70% 아래까지 오면 "가까이 왔다"
 GOAL_MISS_TIMEOUT = 0.40       # 가까이 온 뒤 이 시간 동안 안 보이면 "사라졌다"
 GOAL_GIVEUP_SEC = 3.0          # 멀리서 놓친 채 이 시간이 지나면 그래도 마무리 직진
-GOAL_FINAL_FORWARD_SEC = 2.0   # 사라진 뒤 추가 직진 시간
+GOAL_FINAL_FORWARD_SEC = 6.0   # 사라진 뒤 추가 직진 시간
 
 
 # ============================================================
