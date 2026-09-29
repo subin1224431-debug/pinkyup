@@ -171,7 +171,7 @@ NARROW_RATIO = 0.60          # 도로 폭이 평소(BASE)의 60% 아래로 줄�
 NARROW_SIDE_ERR = 35         # 중심선 오차가 이 픽셀 이상 옆으로 쏠려야 함
                              #   0 으로 하면 폭만 보고 판단
 NARROW_CONFIRM_FRAMES = 2    # 좁아짐이 연속 몇 프레임이어야 멈출지
-NARROW_FORWARD_SEC = 0.7     # ★ 좁아짐 감지 후 이 시간만큼 더 직진하고 멈춤 (0 이면 바로 멈춤)
+NARROW_FORWARD_SEC = 0.85     # ★ 좁아짐 감지 후 이 시간만큼 더 직진하고 멈춤 (0 이면 바로 멈춤)
 NARROW_FORWARD_SPEED = 16    #   그때 직진 속도
 NARROW_ARM_SEC = 2.0         # STOP1 끝나고 이 시간 동안은 감지 안 함 (평소 폭 학습 시간)
 NARROW_BASE_FRAMES = 15      # 평소 폭(BASE)을 최근 몇 프레임의 중간값으로 잡을지
@@ -199,7 +199,7 @@ FINAL_RIGHT_TURN_SEC = FINAL_TURN_DEG / TURN_DEG_PER_SEC   # 120도 -> 약 1.35�
 GOAL_NEAR_RATIO = 0.70         # 박스 하단이 화면 70% 아래까지 오면 "가까이 왔다"
 GOAL_MISS_TIMEOUT = 0.40       # 가까이 온 뒤 이 시간 동안 안 보이면 "사라졌다"
 GOAL_GIVEUP_SEC = 3.0          # 멀리서 놓친 채 이 시간이 지나면 그래도 마무리 직진
-GOAL_FINAL_FORWARD_SEC = 6.0   # 사라진 뒤 추가 직진 시간
+GOAL_FINAL_FORWARD_SEC = 7.0   # 사라진 뒤 추가 직진 시간
 
 
 # ============================================================
