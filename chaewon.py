@@ -120,7 +120,7 @@ TEXT_MIN_ASPECT = {"STOP": 1.5, "STATION": 2.0, "GOAL": 1.3}
 # ★ [조정용] 구간별 최소 신뢰도
 #   STOP2: 화살표가 있어서 더 엄격
 #   GOAL : 모델 신뢰도가 낮게 나와서 낮춤 (엉뚱한 곳에 GOAL이 잡히면 0.30~0.35로 올릴 것)
-STAGE_MIN_CONF = {"STOP2": 0.60, "GOAL": 0.25}
+STAGE_MIN_CONF = {"STATION": 0.35, "STOP2": 0.60, "GOAL": 0.25}
 
 # route_stage 별로 찾아야 하는 글씨
 STAGE_TARGET = {"STOP1": "STOP", "STATION": "STATION", "STOP2": "STOP", "GOAL": "GOAL"}
@@ -135,11 +135,22 @@ YOLO_STATES = {
 
 # 중심선 주행 중 글씨가 이 프레임 수만큼 연속으로 보여야 이벤트 실행 (화살표 순간 오인식 무시)
 EVENT2_CONFIRM_FRAMES = 3
-EVENT2_CONFIRM_FRAMES_BY_TYPE = {"GOAL": 2}   # GOAL은 깜빡이므로 2프레임만 확인
+EVENT2_CONFIRM_FRAMES_BY_TYPE = {"GOAL": 2, "STATION": 2}   # GOAL/STATION은 2프레임만 확인
+
+# ============================================================
+# ★ [조정용] STATION 인식 속도
+# 이전: 확인 3프레임 -> 멈춤 -> 전체 보임 3프레임 더 확인 = 라즈베리파이에서 약 3초
+# 지금: 확인하는 동안 이미 글자 전체가 보였으면 추가 확인 없이 바로 접근
+# ============================================================
+FAST_FULL_FRAMES = 2          # 확인 중 "전체 보임"이 이 프레임 이상이면 바로 APPROACH_TEXT
+# 화살표 없는 구간에서는 한 프레임 놓쳐도 카운트를 0으로 리셋하지 않고 1만 깎음
+# (STOP2 구간은 화살표 때문에 기존처럼 엄격하게 리셋)
+EVENT2_STRICT_STAGES = {"STOP2"}
 
 # ★ [조정용] 글자 전체 확인 (SEARCH_TEXT / TEXT_SEEK_FULL 공통)
-FULL_MARGIN = 35           # 박스 좌우가 화면 끝에서 이 픽셀 이상 떨어져야 "전체 보임"
-FULL_STABLE_FRAMES = 3     # 전체 보임이 연속 몇 프레임 유지돼야 출발할지
+FULL_MARGIN = 20           # 박스 좌우가 화면 끝에서 이 픽셀 이상 떨어져야 "전체 보임"
+                           # (다시 STATIO에서 출발하면 30~35로 올릴 것)
+FULL_STABLE_FRAMES = 2     # 전체 보임이 연속 몇 프레임 유지돼야 출발할지
 SEEK_TURN_SPEED = 14       # 찾기 회전 속도
 SEEK_PULSE_ON = 0.12       # 회전 펄스: 이만큼 돌고
 SEEK_PULSE_OFF = 0.15      #            이만큼 멈춰서 YOLO가 다시 보게 함
@@ -153,7 +164,14 @@ STOP_AFTER_TEXT_SEC = 3.0
 
 # STOP2 이후 GOAL 구간
 FINAL_STOP_FORWARD_SEC = 3.0
-FINAL_RIGHT_TURN_SEC = 0.90    # 90도를 시간으로 근사. 현장에서 0.1초 단위 튜닝
+# ★ [조정용] STOP2 이후 마지막 우회전 각도
+# 기존 0.90초 = 실제로 약 80도 -> 초당 약 89도로 계산
+#   더 돌아야 하면 FINAL_TURN_DEG 를 올리고, 너무 돌면 내릴 것
+#   각도가 맞는데 매번 조금씩 다르면 TURN_DEG_PER_SEC 를 현장에서 다시 측정
+FINAL_TURN_DEG = 120
+TURN_DEG_PER_SEC = 80 / 0.90
+FINAL_TURN_SPEED = 18
+FINAL_RIGHT_TURN_SEC = FINAL_TURN_DEG / TURN_DEG_PER_SEC   # 120도 -> 약 1.35초
 
 # ★ [조정용] GOAL: 박스를 따라 직진 -> 박스가 사라지면 2초 더 직진 -> 완전 정지
 GOAL_NEAR_RATIO = 0.70         # 박스 하단이 화면 70% 아래까지 오면 "가까이 왔다"
@@ -221,6 +239,7 @@ class State:
         self.text_candidate_type = None
         self.text_full_count = 0
         self.event2_hits = 0
+        self.event2_full_hits = 0      # 확인 중 글자 전체가 보인 프레임 수
 
         self.seek_dir = 1               # 1 = 오른쪽 회전, -1 = 왼쪽 회전
         self.seek_lost_since = None
@@ -565,9 +584,14 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
         # [이벤트 2] 글씨가 연속 프레임으로 확인되면 글씨 처리 시작
         elif t is not None and event2_confirmed:
             S.current_text_type = t["type"]
+            full_hits = S.event2_full_hits
             S.event2_hits = 0
+            S.event2_full_hits = 0
             if S.current_text_type == "GOAL":
                 start_goal_approach("[YOLO] GOAL detected -> GOAL_APPROACH")
+            elif fully_visible(t, w) and full_hits >= FAST_FULL_FRAMES:
+                # 이미 글자 전체가 보였음 -> 멈춰서 다시 확인하지 않고 바로 접근
+                enter("APPROACH_TEXT", f"[YOLO] {S.current_text_type} already full -> APPROACH_TEXT (fast)")
             else:
                 start_text_seek(t, w)
 
@@ -681,15 +705,17 @@ def step_auto(t, w, h, error, offset_error, event2_confirmed):
             drive(TEXT_FOLLOW_SPEED, TEXT_FOLLOW_SPEED)
         else:
             stop_robot()
-            enter("FINAL_RIGHT_TURN", f"[ROUTE] final forward {FINAL_STOP_FORWARD_SEC:.1f}s done -> big right turn")
+            enter("FINAL_RIGHT_TURN", f"[ROUTE] final forward {FINAL_STOP_FORWARD_SEC:.1f}s done -> right turn {FINAL_TURN_DEG}deg ({FINAL_RIGHT_TURN_SEC:.2f}s)")
 
     elif st == "FINAL_RIGHT_TURN":
         if state_elapsed() < FINAL_RIGHT_TURN_SEC:
-            drive(TURN_SPEED, -TURN_SPEED)
+            drive(FINAL_TURN_SPEED, -FINAL_TURN_SPEED)
         else:
             stop_robot()
             S.route_stage = "GOAL"
-            enter("CENTERLINE", "[ROUTE] final right turn done -> CENTERLINE / SEARCH GOAL")
+            S.exit_err = None          # 회전 전 오차 기억 지우고 새로 중심선 시작
+            S.exit_lost_since = None
+            enter("CENTERLINE", f"[ROUTE] final right turn {FINAL_TURN_DEG}deg done -> CENTERLINE / SEARCH GOAL")
 
     # ---------------- GOAL ----------------
     # GOAL 박스를 따라 직진. 박스가 안 보여도 멈추지 않고 그대로 직진
@@ -828,7 +854,15 @@ def control_loop():
                 print("YOLO ERROR:", e)
 
         # 이벤트 2 연속 확인 카운트 (CENTERLINE에서만)
-        S.event2_hits = S.event2_hits + 1 if (S.drive_state == "CENTERLINE" and t is not None) else 0
+        if S.drive_state == "CENTERLINE" and t is not None:
+            S.event2_hits += 1
+            S.event2_full_hits = S.event2_full_hits + 1 if fully_visible(t, w) else 0
+        elif S.drive_state == "CENTERLINE" and S.route_stage not in EVENT2_STRICT_STAGES:
+            # 화살표 없는 구간: 한 프레임 놓쳐도 1만 깎음
+            S.event2_hits = max(0, S.event2_hits - 1)
+        else:
+            S.event2_hits = 0
+            S.event2_full_hits = 0
         need = EVENT2_CONFIRM_FRAMES_BY_TYPE.get(t["type"], EVENT2_CONFIRM_FRAMES) if t else EVENT2_CONFIRM_FRAMES
         event2_confirmed = S.event2_hits >= need
 
